@@ -494,9 +494,11 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_splitk(
     float* __restrict__ part_o,           // [M, 24, n_splits, 128]
     int M,
     int n_splits = kInkAttnSplits) {
-    const int kh = blockIdx.x;  // 0..7
-    const int sp = blockIdx.y;  // 0..n_splits-1
-    const int m  = blockIdx.z;  // 0..M-1
+    // Tokens vary fastest: the M blocks reading the same (head, split) KV range run together, so with the global KV
+    // in mapped host RAM (8 GB cards) the tree verify reads it over PCIe about once instead of once per token.
+    const int m  = blockIdx.x;  // 0..M-1
+    const int kh = blockIdx.y;  // 0..7
+    const int sp = blockIdx.z;  // 0..n_splits-1
     if (kh >= kInkKVHeads || sp >= n_splits || m >= M) return;
 
     const int tid  = threadIdx.x;

@@ -924,6 +924,12 @@ option(STRATA_BUILD_INKLING2 "Build strata-inkling: Inkling-2-Mini (.strata v1.1
 if((STRATA_BUILD_INKLING AND STRATA_BUILD_INKLING2) AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/inkling2/CMakeLists.txt")
   add_subdirectory(src/inkling2)
 endif()
+# strata-inkling's S2_K/S3_K CPU expert kernels against a scalar reference (CPU only; --bench times them)
+if(STRATA_BUILD_TESTS AND TARGET strata_inkling_core)
+  add_executable(ink_host_sk_test tests/core/ink_host_sk_test.cpp)
+  target_link_libraries(ink_host_sk_test PRIVATE strata_inkling_core)
+  add_test(NAME ink_host_sk_test COMMAND ink_host_sk_test)
+endif()
 
 # What this configure registered, so a missing capability is a stated skip (tools/check prints this line too).
 if(STRATA_BUILD_TESTS)

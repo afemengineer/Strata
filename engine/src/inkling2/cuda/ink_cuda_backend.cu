@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -775,12 +776,29 @@ public:
         // 2. True W=4 Multi-Branch Sparse-MoE Bayes-Optimal Adaptive Beam Tree (M* in {3,4,5,6,8,10,12})!
         strata::ink::InkTreeSpec tr{};
         const int max_nodes = std::min(12, runner_->tree_cap);
+        // Experiment (STRATA_INK_SPEC_STATS=N): where a speculative step's time goes. Syncs only when on.
+        static const int spec_stats = std::getenv("STRATA_INK_SPEC_STATS") ? std::atoi(std::getenv("STRATA_INK_SPEC_STATS")) : 0;
+        static double ss_draft = 0, ss_verify = 0, ss_head = 0; static long ss_n = 0, ss_nodes = 0;
+        auto ss_now = [&]() { if (spec_stats) INK_CK(cudaStreamSynchronize(runner_->st)); return std::chrono::steady_clock::now(); };
+        const auto ss_t0 = ss_now();
         dspark_->draft_beam_tree(anchor_tok, anchor_pos, /*beam_w=*/4, max_nodes, tr, /*adaptive_moe_ratio=*/4.2f);
+        const auto ss_t1 = ss_now();
 
         // 3. Single CUDA-Graph 48-visit tree verify + exact GPU screened argmax (ZERO 6.4 MB logits D2H!)
         runner_->forward_tree_verify(tr, anchor_pos, 0, true);
+        const auto ss_t2 = ss_now();
         int32_t target_next[strata::ink::kInkMaxTree] = {};
         runner_->head_argmax_exact(tr.M, target_next);
+        if (spec_stats) {
+            const auto ss_t3 = std::chrono::steady_clock::now();
+            ss_draft += std::chrono::duration<double>(ss_t1 - ss_t0).count();
+            ss_verify += std::chrono::duration<double>(ss_t2 - ss_t1).count();
+            ss_head += std::chrono::duration<double>(ss_t3 - ss_t2).count();
+            ss_nodes += tr.M;
+            if (++ss_n % spec_stats == 0)
+                std::fprintf(stderr, "[spec-stats] steps=%ld nodes=%.1f draft=%.1f verify=%.1f head=%.1f ms/step\n", ss_n, (double)ss_nodes / ss_n,
+                             1e3 * ss_draft / ss_n, 1e3 * ss_verify / ss_n, 1e3 * ss_head / ss_n);
+        }
 
         // 4. Exact greedy tree walk (clamped to min(max_emit, 8))
         const int emit_cap = std::min(max_emit, 8);

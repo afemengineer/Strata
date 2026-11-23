@@ -6,12 +6,22 @@
 #include "ink_host_avx2.h"
 #include "strata/quant/isa.hpp"
 
+#include <cstdlib>
+#include <cstring>
+
 #if defined(INK_BUILD_HOST_AVX2) && defined(__AVX2__)
 #include <immintrin.h>
 #define INK_TU_HAS_AVX2 1
 #endif
 
 namespace strata::ink::host_avx2 {
+
+void sk_act_planar(const int8_t* qs, float d, float s, SkActG64& out) noexcept {
+    for (int j = 0; j < 16; ++j)
+        for (int k = 0; k < 4; ++k) out.qs[k * 16 + j] = qs[4 * j + k];
+    out.d = d;
+    out.s = s;
+}
 
 bool available() noexcept {
 #if defined(INK_TU_HAS_AVX2)
@@ -220,7 +230,106 @@ float dot_sk_sub64(const uint8_t* pl, int fmt, int g, const int8_t* qs, float x_
     return 0.0f;
 }
 
+namespace {
+
+constexpr int kSkMaxT = 16;
+
+// S2_K / S3_K low 2 bits of one 64-value group (16 bytes, value 4j+k in bits 2k..2k+1 of byte j),
+// unpacked in planar order: w0 = values k=0 (bytes 0..15) and k=1 (16..31), w1 = k=2 and k=3.
+// srlv on 32-bit lanes shifts neighbour bits into each byte's top, which the mask drops.
+inline void sk_lo2_planar(const uint8_t* p, __m256i& w0, __m256i& w1) noexcept {
+    const __m256i b  = _mm256_broadcastsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
+    const __m256i m3 = _mm256_set1_epi8(3);
+    w0 = _mm256_and_si256(_mm256_srlv_epi32(b, _mm256_setr_epi32(0, 0, 0, 0, 2, 2, 2, 2)), m3);
+    w1 = _mm256_and_si256(_mm256_srlv_epi32(b, _mm256_setr_epi32(4, 4, 4, 4, 6, 6, 6, 6)), m3);
+}
+
+// S3_K third bit (8 bytes, value e in bit e%8 of byte e/8) added as bit 2 of the planar values.
+// Value 4j+k lives in byte j/2, bit 4*(j%2)+k: expand each byte to two (low/high nibble), then
+// pick bit k per planar quarter.
+inline void sk_hi1_planar(const uint8_t* hp, __m256i& w0, __m256i& w1) noexcept {
+    const __m128i h8  = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(hp));
+    const __m128i h2  = _mm_shuffle_epi8(h8, _mm_setr_epi8(0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7));
+    const __m128i odd = _mm_setr_epi8(0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1);
+    const __m128i hx  = _mm_blendv_epi8(h2, _mm_srli_epi16(h2, 4), odd);
+    const __m256i hb  = _mm256_broadcastsi128_si256(hx);
+    const __m256i one = _mm256_set1_epi8(1);
+    const __m256i h01 = _mm256_and_si256(_mm256_srlv_epi32(hb, _mm256_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1)), one);
+    const __m256i h23 = _mm256_and_si256(_mm256_srlv_epi32(hb, _mm256_setr_epi32(2, 2, 2, 2, 3, 3, 3, 3)), one);
+    w0 = _mm256_or_si256(w0, _mm256_slli_epi16(h01, 2));
+    w1 = _mm256_or_si256(w1, _mm256_slli_epi16(h23, 2));
+}
+
+inline __m256i sk_dot_u8_i8(__m256i w0, __m256i w1, const int8_t* qs) noexcept {
+    const __m256i ones = _mm256_set1_epi16(1);
+    const __m256i q0 = _mm256_load_si256(reinterpret_cast<const __m256i*>(qs));
+    const __m256i q1 = _mm256_load_si256(reinterpret_cast<const __m256i*>(qs + 32));
+    return _mm256_add_epi32(_mm256_madd_epi16(_mm256_maddubs_epi16(w0, q0), ones),
+                            _mm256_madd_epi16(_mm256_maddubs_epi16(w1, q1), ones));
+}
+
+template <int FMT>
+void sk_rows_dot_fmt(const uint8_t* rows, size_t row_stride, int n_rows, int n_groups,
+                     const SkActG64* act, int act_groups, int T, float* out, size_t out_stride) noexcept {
+    constexpr int sb = (FMT == kFmtS2_K) ? 70 : 102;
+    constexpr float off = (FMT == kFmtS2_K) ? 1.5f : 3.5f;
+    const int n_out = n_groups / act_groups;
+    const int n_sb = n_groups / 4;
+    for (int r = 0; r < n_rows; ++r) {
+        const uint8_t* row = rows + (size_t)r * row_stride;
+        __m256 acc[kSkMaxT][2];
+        float corr[kSkMaxT][2];
+        for (int t = 0; t < T; ++t) {
+            acc[t][0] = acc[t][1] = _mm256_setzero_ps();
+            corr[t][0] = corr[t][1] = 0.0f;
+        }
+        int ai = 0, o = 0;  // k % act_groups and k / act_groups, stepped instead of divided per group
+        for (int s = 0; s < n_sb; ++s) {
+            const uint8_t* blk = row + (size_t)s * sb;
+            uint16_t d16;
+            std::memcpy(&d16, blk, 2);
+            const float d = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(d16))) * (1.0f / 255.0f);
+            const uint8_t* pl = blk + 6;
+            for (int gi = 0; gi < 4; ++gi, ++ai) {
+                if (ai == act_groups) { ai = 0; ++o; }
+                const float eff = d * (float)blk[2 + gi];
+                __m256i w0, w1;
+                sk_lo2_planar(pl + gi * 16, w0, w1);
+                if (FMT == kFmtS3_K) sk_hi1_planar(pl + 64 + gi * 8, w0, w1);
+                for (int t = 0; t < T; ++t) {
+                    const SkActG64& a = act[(size_t)t * act_groups + ai];
+                    const __m256 f = _mm256_cvtepi32_ps(sk_dot_u8_i8(w0, w1, a.qs));
+                    acc[t][o] = _mm256_fmadd_ps(f, _mm256_set1_ps(eff * a.d), acc[t][o]);
+                    corr[t][o] += eff * a.s;
+                }
+            }
+        }
+        for (int t = 0; t < T; ++t) {
+            float* dst = out + (size_t)t * out_stride + (size_t)r * n_out;
+            for (int o = 0; o < n_out; ++o) dst[o] = avx2_hsum_ps(acc[t][o]) - off * corr[t][o];
+        }
+    }
+}
+
+}  // namespace
+
+bool sk_rows_supported(int fmt) noexcept {
+    // STRATA_INK_HOST_SK_OLD=1 keeps the per-group path, to compare the two on one build.
+    static const bool on = available() && !std::getenv("STRATA_INK_HOST_SK_OLD");
+    return on && (fmt == kFmtS2_K || fmt == kFmtS3_K);
+}
+
+void sk_rows_dot(const uint8_t* rows, size_t row_stride, int n_rows, int fmt, int n_groups,
+                 const SkActG64* act, int act_groups, int T, float* out, size_t out_stride) noexcept {
+    T = T < kSkMaxT ? T : kSkMaxT;
+    if (fmt == kFmtS2_K) sk_rows_dot_fmt<kFmtS2_K>(rows, row_stride, n_rows, n_groups, act, act_groups, T, out, out_stride);
+    else if (fmt == kFmtS3_K) sk_rows_dot_fmt<kFmtS3_K>(rows, row_stride, n_rows, n_groups, act, act_groups, T, out, out_stride);
+}
+
 #else
+
+bool sk_rows_supported(int) noexcept { return false; }
+void sk_rows_dot(const uint8_t*, size_t, int, int, int, const SkActG64*, int, int, float*, size_t) noexcept {}
 
 float dot_sf4_row(const uint8_t*, const uint8_t*, float, const float*, int, const float*) noexcept { return 0.0f; }
 float dot_mx8_row(const uint8_t*, const uint8_t*, const float*, int, const float*, const float*) noexcept { return 0.0f; }

@@ -458,6 +458,21 @@ struct InkCudaModel {
                     ++n_host_experts;
                 }
             }
+            if (std::getenv("STRATA_INK_FMT_HIST")) {
+                // Experiment: which expert formats land off the GPU (gu/dn code -> count, MiB).
+                size_t cnt[2][32] = {}, byt[2][32] = {};
+                for (int di = 0; di < n_total; ++di) {
+                    const auto& e = dir[di];
+                    const int where = in_vram[di] ? 0 : 1;
+                    cnt[where][e.gu_code_id & 31]++; byt[where][e.gu_code_id & 31] += e.body_bytes;
+                }
+                for (int w = 0; w < 2; ++w)
+                    for (int c = 0; c < 32; ++c)
+                        if (cnt[w][c]) std::fprintf(stderr, "[fmt-hist] %s gu_code=%d experts=%zu MiB=%.0f\n", w ? "host" : "vram", c, cnt[w][c], byt[w][c] / 1048576.0);
+                size_t dcnt[32] = {};
+                for (int di = 0; di < n_total; ++di) dcnt[dir[di].dn_code_id & 31]++;
+                for (int c = 0; c < 32; ++c) if (dcnt[c]) std::fprintf(stderr, "[fmt-hist] all dn_code=%d experts=%zu\n", c, dcnt[c]);
+            }
             // #6617: Allocate ping-pong prefill staging buffers BEFORE d_sec4 and the pinned host arena so
             // pinned-RAM VRAM page tables can never starve pf_buf to 0 MB and silently skip host experts!
             if (n_host_experts > 0) {
@@ -3020,7 +3035,7 @@ struct InkCudaRunner {
             k_ink_rel_table<<<gr, 256, 0, st>>>(d_r, (const float*)m.trunk_ptr_stage(cur_stage, p + ".attn.rel_logits_proj.proj"), d_rel_table, M);
             if (M <= 16 || mode == 2) {
                 const int n_sp = (M == 1) ? (is_swa ? 16 : kInkAttnMaxSplits) : kInkAttnSplits;
-                dim3 gsp(kInkKVHeads, n_sp, M);
+                dim3 gsp(M, kInkKVHeads, n_sp);
                 k_ink_flash_gqa_splitk<<<gsp, 128, 0, st>>>(
                     d_q, d_rel_table, d_sinks,
                     kv_desc[visit], (mode == 1) ? d_slots : nullptr, slot0, d_pos,

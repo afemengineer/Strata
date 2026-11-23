@@ -581,6 +581,60 @@ inline void eval_gguf_raw_batch_h(
     }
 }
 
+// Whole-row S2_K/S3_K path (host_avx2::sk_rows_dot) for the formats 8 GB cards leave in RAM: on a Core
+// Ultra 7 265F one SQ-10 expert took 3.1 ms on one thread with the per-group dot_sk_sub64 path, 0.44 ms here.
+// Gate/up for T tokens -> act[t * I + j] (SITU and the per-row 1/sq already applied).
+inline void sk_gate_up_fast(const uint8_t* body, int gu_code, const float* const* xs, int T, float* act) noexcept {
+    using host_avx2::SkActG64;
+    constexpr int D = kInkHidden, I = kInkInter, G = D / 64;
+    thread_local std::vector<SkActG64> xa;
+    thread_local std::vector<float> gb, ub;
+    xa.resize((size_t)T * G);
+    gb.resize((size_t)T * I);
+    ub.resize((size_t)T * I);
+    for (int t = 0; t < T; ++t) {
+        InkQ8_1_G64 xq[G];
+        quant_q8_1_h(xs[t], xq, D);
+        for (int g = 0; g < G; ++g) host_avx2::sk_act_planar(xq[g].qs, xq[g].d, xq[g].s, xa[(size_t)t * G + g]);
+    }
+    const size_t row_b = 9ull * ink_sb_bytes(gu_code);
+    const uint8_t* gu_base = body + I * 2;
+    host_avx2::sk_rows_dot(gu_base, 2 * row_b, I, gu_code, G, xa.data(), G, T, gb.data(), I);
+    host_avx2::sk_rows_dot(gu_base + row_b, 2 * row_b, I, gu_code, G, xa.data(), G, T, ub.data(), I);
+    for (int j = 0; j < I; ++j) {
+        uint16_t sq_bits;
+        std::memcpy(&sq_bits, body + j * 2, 2);
+        const float inv_sq = 1.0f / f16_to_f32_h(sq_bits);
+        for (int t = 0; t < T; ++t) {
+            const float g = gb[(size_t)t * I + j], u = ub[(size_t)t * I + j];
+            const float sig = 1.0f / (1.0f + std::exp(-g));
+            act[(size_t)t * I + j] = (kInkSituBeta * std::tanh(g / kInkSituBeta) * sig) * (kInkSituLb * std::tanh(u / kInkSituLb)) * inv_sq;
+        }
+    }
+}
+
+// Down projection for T tokens: D/2 pair rows of 36 groups, groups 0..17 -> row 2p, 18..35 -> row 2p+1.
+inline void sk_down_fast(const uint8_t* dn_base, int dn_code, const float* act, int T, float* const* ys) noexcept {
+    using host_avx2::SkActG64;
+    constexpr int D = kInkHidden, I = kInkInter, G = I / 64;
+    thread_local std::vector<SkActG64> ha;
+    thread_local std::vector<float> yb;
+    ha.resize((size_t)T * G);
+    for (int t = 0; t < T; ++t) {
+        InkQ8_1_G64 hq[G];
+        quant_q8_1_h(act + (size_t)t * I, hq, I);
+        for (int g = 0; g < G; ++g) host_avx2::sk_act_planar(hq[g].qs, hq[g].d, hq[g].s, ha[(size_t)t * G + g]);
+    }
+    const size_t pair_b = 9ull * ink_sb_bytes(dn_code);
+    if (T == 1) {
+        host_avx2::sk_rows_dot(dn_base, pair_b, D / 2, dn_code, 2 * G, ha.data(), G, 1, ys[0], D);
+        return;
+    }
+    yb.resize((size_t)T * D);
+    host_avx2::sk_rows_dot(dn_base, pair_b, D / 2, dn_code, 2 * G, ha.data(), G, T, yb.data(), D);
+    for (int t = 0; t < T; ++t) std::memcpy(ys[t], yb.data() + (size_t)t * D, (size_t)D * sizeof(float));
+}
+
 inline void eval_expert_f32_h(const InkHostExpertMeta& em, const float* x, float* y_out,
                               const uint8_t* body_override = nullptr,
                               void (*wait_down)(void*) = nullptr, void* wait_ctx = nullptr) noexcept {
@@ -600,7 +654,10 @@ inline void eval_expert_f32_h(const InkHostExpertMeta& em, const float* x, float
     float act[I];
 
     // 1. Gate + Up + SITU(4.0, 25.0)
-    if (em.gu_code == FMT_SF4) {
+    if (host_avx2::sk_rows_supported(em.gu_code)) {
+        const float* xs[1] = {x};
+        sk_gate_up_fast(body, em.gu_code, xs, 1, act);
+    } else if (em.gu_code == FMT_SF4) {
         float hdr[4];
         std::memcpy(hdr, body, 16);
         const float w_outer = hdr[0] / hdr[1];
@@ -652,7 +709,10 @@ inline void eval_expert_f32_h(const InkHostExpertMeta& em, const float* x, float
 
     // 2. Down projection [D, I] (overlaps gate+up+SITU compute with down NVMe read when wait_down is set!)
     if (wait_down) wait_down(wait_ctx);
-    if (em.dn_code == FMT_SF4) {
+    if (host_avx2::sk_rows_supported(em.dn_code)) {
+        float* ys[1] = {y_out};
+        sk_down_fast(body + em.dn_off, em.dn_code, act, 1, ys);
+    } else if (em.dn_code == FMT_SF4) {
         float hdr[4];
         std::memcpy(hdr, body, 16);
         const float w_outer = hdr[2] / hdr[3];
@@ -723,7 +783,9 @@ inline void eval_expert_batch_f32_h(
     float act[MAX_T][I];
 
     // 1. Gate + Up + SITU(4.0, 25.0) — reuse each weight row across all T tokens in L1!
-    if (em.gu_code == FMT_SF4) {
+    if (host_avx2::sk_rows_supported(em.gu_code)) {
+        sk_gate_up_fast(body, em.gu_code, xs, T, &act[0][0]);
+    } else if (em.gu_code == FMT_SF4) {
         float hdr[4];
         std::memcpy(hdr, body, 16);
         const float w_outer = hdr[0] / hdr[1];
@@ -794,7 +856,9 @@ inline void eval_expert_batch_f32_h(
 
     // 2. Down projection [D, I]
     if (wait_down) wait_down(wait_ctx);
-    if (em.dn_code == FMT_SF4) {
+    if (host_avx2::sk_rows_supported(em.dn_code)) {
+        sk_down_fast(body + em.dn_off, em.dn_code, &act[0][0], T, ys);
+    } else if (em.dn_code == FMT_SF4) {
         float hdr[4];
         std::memcpy(hdr, body, 16);
         const float w_outer = hdr[2] / hdr[3];
@@ -988,6 +1052,11 @@ struct InkHybridEngine {
     int32_t* d_v_p  = nullptr;   // device pair indices
     double dec_pcie_share = -1.0; // -1 = auto, 0 = 100% CPU, 1 = 100% PCIe DMA (STRATA_INK_DEC_PCIE_SHARE)
     uint32_t promo_step = 0;      // cadence counter so step_promote does NOT sync every single token!
+    int stats_every = 0;          // experiment: STRATA_INK_HYB_STATS
+    uint64_t st_rings = 0, st_jobs = 0;
+    double st_cpu_s = 0.0;
+    long vs_n = 0, vs_host_n = 0, vs_cpu_n = 0;
+    double vs_sync = 0.0, vs_cpu = 0.0, vs_tot = 0.0;
     bool l3_pf_enabled = true;    // STRATA_L3_PF: idle-worker next-layer L3 prefetch
     std::atomic<uint32_t> pf_gen{0};
     int pf_layer = -1, pf_n = 0;
@@ -1126,10 +1195,211 @@ struct InkHybridEngine {
         }
     }
 
+    // ---- Row-split evaluation: each S2_K/S3_K expert's rows spread over all pool threads ----
+    // Traced (PC-101: Core Ultra 7 265F, RTX 4060 8 GB, SQ-10): a DSpark verify visit has ~8 off-GPU experts and a
+    // single-token visit ~3.7, so one expert per thread left most of the 10 threads idle while the GPU waited on the
+    // slowest expert. Phase A runs gate/up row chunks (and whole-expert jobs for other formats or SSD-cold experts);
+    // the thread that finishes a group's last chunk quantizes its activations; phase B runs down-projection chunks.
+    struct SplitGroup {
+        const InkHostExpertMeta* hm = nullptr;
+        const uint8_t* body = nullptr;
+        int T = 0;
+        const host_avx2::SkActG64* xa = nullptr;  // [T][kInkHidden / 64] planar activations
+        float* ys[16] = {};
+    };
+    struct SplitTask {
+        int kind;  // 0 whole doorbell job, 1 whole verify group, 2 gate/up rows [r0, r1), 3 down pair rows [r0, r1)
+        int a;     // job, verify group or split group index
+        int r0, r1;
+    };
+    static constexpr int kSplitXG = kInkHidden / 64;  // 36 activation groups per token for gate/up
+    static constexpr int kSplitHG = kInkInter / 64;   // 18 for down
+    bool split_on = true;                             // STRATA_INK_HOST_SPLIT=0: one expert per thread, as before
+    int split_rows = 128;                             // STRATA_INK_SPLIT_ROWS: rows per task
+    std::vector<SplitGroup> sp_groups;
+    std::vector<SplitTask> sp_tasks;
+    std::vector<host_avx2::SkActG64> sp_xtok, sp_xa, sp_ha;
+    std::vector<float> sp_gu, sp_act, sp_y;
+    std::atomic<int> sp_left[kInkExperts];
+    std::atomic<int> task_next{0};
+    int n_tasks = 0;
+
+    bool split_ok(const InkHostExpertMeta& hm) const noexcept {
+        return split_on && hm.body != nullptr && host_avx2::sk_rows_supported(hm.gu_code) &&
+               host_avx2::sk_rows_supported(hm.dn_code);
+    }
+
+    void split_reserve(int ng) {
+        const size_t g = (size_t)std::max(ng, 1);
+        if (sp_groups.size() < g) sp_groups.resize(g);
+        if (sp_xa.size() < g * 16 * kSplitXG) sp_xa.resize(g * 16 * kSplitXG);
+        if (sp_ha.size() < g * 16 * kSplitHG) sp_ha.resize(g * 16 * kSplitHG);
+        if (sp_gu.size() < g * 32 * kInkInter) sp_gu.resize(g * 32 * kInkInter);
+        if (sp_act.size() < g * 16 * kInkInter) sp_act.resize(g * 16 * kInkInter);
+        if (sp_y.size() < g * 16 * kInkHidden) sp_y.resize(g * 16 * kInkHidden);
+        if (sp_xtok.size() < 16 * kSplitXG) sp_xtok.resize(16 * kSplitXG);
+    }
+
+    static void quant_planar(const float* x, int n, host_avx2::SkActG64* out) noexcept {
+        InkQ8_1_G64 q[kInkHidden / 64];
+        host_eval::quant_q8_1_h(x, q, n);
+        for (int g = 0; g < n / 64; ++g) host_avx2::sk_act_planar(q[g].qs, q[g].d, q[g].s, out[g]);
+    }
+
+    // Adds group `gi`'s gate/up and down chunks to phase A / the group count used by phase B.
+    void split_push_rows(int gi) {
+        sp_left[gi].store((kInkInter + split_rows - 1) / split_rows, std::memory_order_relaxed);
+        for (int r = 0; r < kInkInter; r += split_rows)
+            sp_tasks.push_back({2, gi, r, std::min(kInkInter, r + split_rows)});
+    }
+
+    void run_task(const SplitTask& tk) noexcept {
+        constexpr int D = kInkHidden, I = kInkInter;
+        if (tk.kind == 0) { eval_doorbell_job(tk.a); return; }
+        if (tk.kind == 1) { eval_verify_group(tk.a); return; }
+        const SplitGroup& G = sp_groups[tk.a];
+        const size_t gi = (size_t)tk.a;
+        const int n = tk.r1 - tk.r0;
+        if (tk.kind == 2) {
+            const size_t row_b = 9ull * ink_sb_bytes(G.hm->gu_code);
+            const uint8_t* gu_base = G.body + I * 2;
+            float* gb = sp_gu.data() + gi * 32 * I;
+            float* ub = gb + 16 * I;
+            host_avx2::sk_rows_dot(gu_base + (size_t)(2 * tk.r0) * row_b, 2 * row_b, n, G.hm->gu_code, kSplitXG,
+                                   G.xa, kSplitXG, G.T, gb + tk.r0, I);
+            host_avx2::sk_rows_dot(gu_base + (size_t)(2 * tk.r0 + 1) * row_b, 2 * row_b, n, G.hm->gu_code, kSplitXG,
+                                   G.xa, kSplitXG, G.T, ub + tk.r0, I);
+            float* act = sp_act.data() + gi * 16 * I;
+            for (int j = tk.r0; j < tk.r1; ++j) {
+                uint16_t sq_bits;
+                std::memcpy(&sq_bits, G.body + j * 2, 2);
+                const float inv_sq = 1.0f / host_eval::f16_to_f32_h(sq_bits);
+                for (int t = 0; t < G.T; ++t) {
+                    const float g = gb[(size_t)t * I + j], u = ub[(size_t)t * I + j];
+                    const float sig = 1.0f / (1.0f + std::exp(-g));
+                    act[(size_t)t * I + j] = (kInkSituBeta * std::tanh(g / kInkSituBeta) * sig) *
+                                             (kInkSituLb * std::tanh(u / kInkSituLb)) * inv_sq;
+                }
+            }
+            // The last gate/up chunk of this expert quantizes its activations for the down projection.
+            if (sp_left[gi].fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                for (int t = 0; t < G.T; ++t) quant_planar(act + (size_t)t * I, I, sp_ha.data() + (gi * 16 + t) * kSplitHG);
+            }
+        } else {
+            const size_t pair_b = 9ull * ink_sb_bytes(G.hm->dn_code);
+            const uint8_t* dn = G.body + G.hm->dn_off + (size_t)tk.r0 * pair_b;
+            const host_avx2::SkActG64* ha = sp_ha.data() + gi * 16 * kSplitHG;
+            if (G.T == 1) {
+                host_avx2::sk_rows_dot(dn, pair_b, n, G.hm->dn_code, 2 * kSplitHG, ha, kSplitHG, 1, G.ys[0] + 2 * tk.r0, D);
+            } else {
+                float* yb = sp_y.data() + gi * 16 * D;
+                host_avx2::sk_rows_dot(dn, pair_b, n, G.hm->dn_code, 2 * kSplitHG, ha, kSplitHG, G.T, yb + 2 * tk.r0, D);
+                for (int t = 0; t < G.T; ++t)
+                    std::memcpy(G.ys[t] + 2 * tk.r0, yb + (size_t)t * D + 2 * tk.r0, (size_t)2 * n * sizeof(float));
+            }
+        }
+    }
+
+    // Runs sp_tasks[0, n) on this thread and every pool worker.
+    void run_tasks_parallel(int n) noexcept {
+        if (n <= 0) return;
+        n_tasks = n;
+        task_next.store(0, std::memory_order_relaxed);
+        work_done.store(0, std::memory_order_relaxed);
+        const bool par = n_threads > 1 && n > 1;
+        if (par) {
+            work_mode = 2;
+            work_gen.fetch_add(1, std::memory_order_release);
+            if (workers_sleeping.load(std::memory_order_acquire) > 0) {
+                std::lock_guard<std::mutex> lk(wake_mu);
+                wake_cv.notify_all();
+            }
+        }
+        while (true) {
+            const int i = task_next.fetch_add(1, std::memory_order_relaxed);
+            if (i >= n) break;
+            run_task(sp_tasks[i]);
+        }
+        if (par) {
+            while (work_done.load(std::memory_order_acquire) < n_threads - 1) std::this_thread::yield();
+            work_mode = 0;
+        }
+    }
+
+    // Phase B: down-projection chunks of the ns split groups.
+    void run_split_down(int ns) noexcept {
+        if (ns <= 0) return;
+        sp_tasks.clear();
+        for (int g = 0; g < ns; ++g)
+            for (int r = 0; r < kInkHidden / 2; r += split_rows)
+                sp_tasks.push_back({3, g, r, std::min(kInkHidden / 2, r + split_rows)});
+        run_tasks_parallel((int)sp_tasks.size());
+    }
+
+    // M=1 doorbell: the cur_nj host experts of cur_layer for cur_x, written to h_bell->y.
+    void run_doorbell_split() noexcept {
+        split_reserve(cur_nj);
+        quant_planar(cur_x, kInkHidden, sp_xa.data());
+        sp_tasks.clear();
+        int ns = 0;
+        for (int j = 0; j < cur_nj; ++j) {
+            const auto& hm = host_meta[cur_layer * n_experts + cur_eid[j]];
+            if (!split_ok(hm)) { sp_tasks.push_back({0, j, 0, 0}); continue; }
+            SplitGroup& G = sp_groups[ns];
+            G.hm = &hm;
+            G.body = hm.body;
+            G.T = 1;
+            G.xa = sp_xa.data();
+            G.ys[0] = const_cast<float*>(h_bell->y[cur_slot_k[j]]);
+            split_push_rows(ns++);
+        }
+        run_tasks_parallel((int)sp_tasks.size());
+        run_split_down(ns);
+    }
+
+    // M=2..16 verify: groups verify_groups[0, ng) of `layer`.
+    void run_verify_split(int ng) noexcept {
+        split_reserve(ng);
+        // Each verify token's activations are quantized once, then copied into every group that uses it.
+        bool tok_done[16] = {};
+        sp_tasks.clear();
+        int ns = 0;
+        for (int gi = 0; gi < ng; ++gi) {
+            const auto& grp = verify_groups[gi];
+            const auto& hm = host_meta[cur_layer * n_experts + grp.eid];
+            if (!split_ok(hm)) { sp_tasks.push_back({1, gi, 0, 0}); continue; }
+            SplitGroup& G = sp_groups[ns];
+            G.hm = &hm;
+            G.body = hm.body;
+            G.T = grp.count;
+            host_avx2::SkActG64* xa = sp_xa.data() + (size_t)ns * 16 * kSplitXG;
+            for (int k = 0; k < grp.count; ++k) {
+                const int pid = grp.pids[k];
+                const int m = pid / kInkTopK;
+                const int os = grp.out_slots[k];
+                h_v_p[os] = pid;
+                G.ys[k] = h_v_y + (size_t)os * kInkHidden;
+                if (m < 16 && !tok_done[m]) {
+                    quant_planar(h_v_x + (size_t)m * kInkHidden, kInkHidden, sp_xtok.data() + (size_t)m * kSplitXG);
+                    tok_done[m] = true;
+                }
+                std::memcpy(xa + (size_t)k * kSplitXG, sp_xtok.data() + (size_t)m * kSplitXG, kSplitXG * sizeof(host_avx2::SkActG64));
+            }
+            G.xa = xa;
+            split_push_rows(ns++);
+        }
+        run_tasks_parallel((int)sp_tasks.size());
+        run_split_down(ns);
+    }
+
     void run_verify_groups(int layer, int ng) noexcept {
         if (ng <= 0) return;
         cur_layer = layer;
         cur_ng = ng;
+        if (split_on && host_avx2::available()) {
+            run_verify_split(ng);
+            return;
+        }
         work_mode = 1;
         verify_next.store(0, std::memory_order_relaxed);
         work_done.store(0, std::memory_order_relaxed);
@@ -1180,6 +1450,9 @@ struct InkHybridEngine {
         n_threads = (num_threads > 0) ? num_threads : std::min(16, std::max(2, hw / 2));
         if (const char* e = std::getenv("STRATA_L3_PF")) l3_pf_enabled = (e[0] != '0');
         if (const char* e = std::getenv("STRATA_INK_DEC_PCIE_SHARE")) dec_pcie_share = std::max(0.0, std::min(1.0, std::atof(e)));
+        if (const char* e = std::getenv("STRATA_INK_HYB_STATS")) stats_every = std::atoi(e);
+        if (const char* e = std::getenv("STRATA_INK_HOST_SPLIT")) split_on = (e[0] != '0');
+        if (const char* e = std::getenv("STRATA_INK_SPLIT_ROWS")) split_rows = std::max(16, std::atoi(e));
         INK_CK(cudaHostAlloc(&h_bell, sizeof(InkMappedDoorbell), cudaHostAllocMapped));
         std::memset(h_bell, 0, sizeof(InkMappedDoorbell));
         INK_CK(cudaHostGetDevicePointer(&d_bell, h_bell, 0));
@@ -1255,7 +1528,13 @@ struct InkHybridEngine {
                         continue;
                     }
                     seen = g;
-                    if (work_mode == 1) {
+                    if (work_mode == 2) {
+                        while (true) {
+                            const int i = task_next.fetch_add(1, std::memory_order_relaxed);
+                            if (i >= n_tasks) break;
+                            run_task(sp_tasks[i]);
+                        }
+                    } else if (work_mode == 1) {
                         while (true) {
                             const int gi = verify_next.fetch_add(1, std::memory_order_relaxed);
                             if (gi >= cur_ng) break;
@@ -1283,6 +1562,7 @@ struct InkHybridEngine {
                     continue;
                 }
                 seen = seq;
+                const auto st_t0 = std::chrono::steady_clock::now();
                 std::atomic_thread_fence(std::memory_order_acquire);
                 cur_layer = h_bell->layer;
                 cur_nj    = std::min((int)h_bell->n_jobs, kInkTopK);
@@ -1298,19 +1578,23 @@ struct InkHybridEngine {
                     }
                 }
                 std::memcpy(cur_x, const_cast<const float*>(h_bell->x), kInkHidden * sizeof(float));
-                work_done.store(0, std::memory_order_relaxed);
-                if (n_threads > 1 && cur_nj > 1) {
-                    work_gen.fetch_add(1, std::memory_order_release);
-                    if (workers_sleeping.load(std::memory_order_acquire) > 0) {
-                        std::lock_guard<std::mutex> lk(wake_mu);
-                        wake_cv.notify_all();
+                if (split_on && host_avx2::available()) {
+                    run_doorbell_split();
+                } else {
+                    work_done.store(0, std::memory_order_relaxed);
+                    if (n_threads > 1 && cur_nj > 1) {
+                        work_gen.fetch_add(1, std::memory_order_release);
+                        if (workers_sleeping.load(std::memory_order_acquire) > 0) {
+                            std::lock_guard<std::mutex> lk(wake_mu);
+                            wake_cv.notify_all();
+                        }
                     }
-                }
-                for (int j = 0; j < cur_nj; j += (cur_nj > 1 ? n_threads : 1)) {
-                    eval_doorbell_job(j);
-                }
-                if (n_threads > 1 && cur_nj > 1) {
-                    while (work_done.load(std::memory_order_acquire) < n_threads - 1) std::this_thread::yield();
+                    for (int j = 0; j < cur_nj; j += (cur_nj > 1 ? n_threads : 1)) {
+                        eval_doorbell_job(j);
+                    }
+                    if (n_threads > 1 && cur_nj > 1) {
+                        while (work_done.load(std::memory_order_acquire) < n_threads - 1) std::this_thread::yield();
+                    }
                 }
                 if (cold_store) {
                     for (int j = 0; j < cur_nj; ++j) {
@@ -1323,6 +1607,15 @@ struct InkHybridEngine {
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 h_bell->ack = seq;
                 last_t = std::chrono::steady_clock::now();
+                if (stats_every > 0) {
+                    // Experiment: how long the GPU waits on the CPU pool per doorbell (STRATA_INK_HYB_STATS=N rings).
+                    st_cpu_s += std::chrono::duration<double>(last_t - st_t0).count();
+                    st_jobs += (uint64_t)cur_nj;
+                    if (++st_rings % (uint64_t)stats_every == 0) {
+                        std::fprintf(stderr, "[hyb-stats] rings=%llu jobs/ring=%.2f cpu=%.3f ms/ring threads=%d\n",
+                                     (unsigned long long)st_rings, (double)st_jobs / st_rings, 1e3 * st_cpu_s / st_rings, n_threads);
+                    }
+                }
             }
         });
         active = true;
@@ -1602,6 +1895,8 @@ inline void launch_ink_moe_hybrid(
         launch_ink_moe_dispatch_only(st, sec4_base, experts, info, x_f32, 1, ws, force_exact_dec, false);
         k_ink_doorbell_wait_collect<<<kInkTopK, 256, 0, st>>>(hyb.d_bell, hyb.d_cur_seq, ws.topk_w, ws.y_pair);
     } else {
+        const auto vs_t0 = std::chrono::steady_clock::now();
+        double vs_sync = 0.0, vs_cpu = 0.0;
         // #6617: Clear y_pair so no unwritten slot can ever carry an earlier layer's stale output!
         INK_CK(cudaMemsetAsync(ws.y_pair, 0, (size_t)M * kInkTopK * kInkHidden * sizeof(float), st));
         // Double-Buffered Ping-Pong Async DMA Streaming + Simultaneous PCIe/CPU Miss-Sharing (M=2..16) + GPU+SSD Wave Planning!
@@ -1620,7 +1915,7 @@ inline void launch_ink_moe_hybrid(
             int ecnt[kInkExperts] = {};
             // Copy ONLY tiny topk_idx (<= 512 B) first so 0-miss visits and tiny-spill PCIe-only visits NEVER stall on x_f32 D2H!
             INK_CK(cudaMemcpyAsync(h_idx, ws.topk_idx, (size_t)M * kInkTopK * 4, cudaMemcpyDeviceToHost, st));
-            INK_CK(cudaStreamSynchronize(st));
+            { const auto a = std::chrono::steady_clock::now(); INK_CK(cudaStreamSynchronize(st)); vs_sync += std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count(); }
             for (int i = 0; i < M * kInkTopK; ++i) {
                 const int e = h_idx[i];
                 const int key = ip * kInkExperts + e;
@@ -1666,7 +1961,7 @@ inline void launch_ink_moe_hybrid(
         } else if (M <= 16 || hyb.ssd_only) {
             std::vector<int32_t> h_idx((size_t)M * kInkTopK);
             INK_CK(cudaMemcpyAsync(h_idx.data(), ws.topk_idx, (size_t)M * kInkTopK * 4, cudaMemcpyDeviceToHost, st));
-            INK_CK(cudaStreamSynchronize(st));
+            { const auto a = std::chrono::steady_clock::now(); INK_CK(cudaStreamSynchronize(st)); vs_sync += std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count(); }
             uint8_t seen[kInkExperts] = {};
             std::vector<int32_t> active_all;
             for (int i = 0; i < M * kInkTopK; ++i) {
@@ -1823,7 +2118,7 @@ inline void launch_ink_moe_hybrid(
                     grp.out_slots[k] = j;
                 }
             }
-            hyb.run_verify_groups(ip, ng);
+            { const auto a = std::chrono::steady_clock::now(); hyb.run_verify_groups(ip, ng); vs_cpu += std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count(); }
             INK_CK(cudaMemcpyAsync(hyb.d_v_y, hyb.h_v_y, (size_t)np * kInkHidden * 4, cudaMemcpyHostToDevice, st));
             INK_CK(cudaMemcpyAsync(hyb.d_v_p, hyb.h_v_p, (size_t)np * 4, cudaMemcpyHostToDevice, st));
             k_ink_scatter_cpu_pairs<<<np, 256, 0, st>>>(hyb.d_v_y, hyb.d_v_p, ws.topk_w, ws.y_pair, np);
@@ -1840,6 +2135,13 @@ inline void launch_ink_moe_hybrid(
             INK_CK(cudaStreamSynchronize(hyb.pf_dma_st));
             unpin_buf_slots(0);
             unpin_buf_slots(1);
+        }
+        if (hyb.stats_every > 0 && M <= 16) {
+            hyb.vs_n++; hyb.vs_sync += vs_sync; hyb.vs_cpu += vs_cpu; hyb.vs_host_n += (long)host_list.size(); hyb.vs_cpu_n += (long)cpu_eids.size();
+            hyb.vs_tot += std::chrono::duration<double>(std::chrono::steady_clock::now() - vs_t0).count();
+            if (hyb.vs_n % (hyb.stats_every * 4) == 0)
+                std::fprintf(stderr, "[verify-stats] visits=%ld M=%d pcie_experts=%.1f cpu_experts=%.1f host ms/visit: gpu-wait=%.3f cpu=%.3f total=%.3f\n",
+                             hyb.vs_n, M, (double)hyb.vs_host_n / hyb.vs_n, (double)hyb.vs_cpu_n / hyb.vs_n, 1e3 * hyb.vs_sync / hyb.vs_n, 1e3 * hyb.vs_cpu / hyb.vs_n, 1e3 * hyb.vs_tot / hyb.vs_n);
         }
     }
 

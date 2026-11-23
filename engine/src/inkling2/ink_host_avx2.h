@@ -18,4 +18,29 @@ float dot_mx8_row(const uint8_t* w, const uint8_t* sc, const float* x, int cols,
 float dot_sk_sub64(const uint8_t* pl, int fmt, int g, const int8_t* qs, float x_d, float x_s,
                    float eff, const int8_t (*s15_lut)[5]) noexcept;
 
+// One q8_1 activation group for sk_rows_dot: 64 int8 values in the kernels' planar order
+// (planar[k * 16 + j] = natural[4 * j + k]), with scale d and s = d * sum(values).
+struct alignas(32) SkActG64 {
+    int8_t qs[64];
+    float d;
+    float s;
+    float pad_[6];
+};
+
+// Fills `out` from a natural-order q8_1 group (qs[64], d, s). Plain C++: callable without AVX2.
+void sk_act_planar(const int8_t* qs, float d, float s, SkActG64& out) noexcept;
+
+// True when sk_rows_dot has a whole-row kernel for `fmt` on this CPU (S2_K and S3_K).
+bool sk_rows_supported(int fmt) noexcept;
+
+// Dot products of n_rows rows of an S*_K matrix with T activation vectors.
+// A row is n_groups groups of 64 values in superblocks of 4 groups (header: f16 d, 4 u8 sub-scales).
+// Group k of a row uses act[t * act_groups + k % act_groups] and is summed into
+// out[t * out_stride + row * n_out + k / act_groups], where n_out = n_groups / act_groups.
+// For the S2_K/S3_K experts that 8 GB cards leave in RAM: gate/up rows give one output per row
+// (act_groups = n_groups = 36), down "pair rows" two (n_groups = 36, act_groups = 18).
+// The old per-group dot_sk_sub64 unpacked S2_K/S3_K one byte at a time and reduced every group.
+void sk_rows_dot(const uint8_t* rows, size_t row_stride, int n_rows, int fmt, int n_groups,
+                 const SkActG64* act, int act_groups, int T, float* out, size_t out_stride) noexcept;
+
 }  // namespace strata::ink::host_avx2
