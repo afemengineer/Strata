@@ -192,7 +192,7 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
     }
 
     double t_dec0 = now_s();
-    int total_gen = 0;
+    int total_gen = 0, n_spec_steps = 0, n_spec_tok = 0;
     if (use_dspark && P == 1) {
         int cur_pos = prompt_len;
         while (total_gen < gen_len && cur_pos < eff_ctx) {
@@ -206,7 +206,7 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
                 if (n_emit > 0) {
                     next_tok[0] = emitted[n_emit - 1];
                     cur_pos += n_emit;
-                    total_gen += n_emit;
+                    total_gen += n_emit; ++n_spec_steps; n_spec_tok += n_emit;
                     continue;
                 }
             }
@@ -241,6 +241,7 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
         }
     }
     double dec_s = now_s() - t_dec0;
+    if (n_spec_steps > 0) fprintf(stderr, "[bench] dspark: %d steps, %d tokens (%.2f per step), %.1f ms per step\n", n_spec_steps, n_spec_tok, (double)n_spec_tok / n_spec_steps, 1000.0 * dec_s / n_spec_steps);
     double ppts = (P * prompt_len) / std::max(pf_s, 1e-9);
     double tps_agg = total_gen / std::max(dec_s, 1e-9);
     printf("[bench] backend=%s format=%s parallel=%d gpus=%d kv=%s prompt=%d gen=%d | prefill=%.1f ppts (%.2fs) | decode=%.1f tps agg (%.1f tps/slot, %.2fs)\n",

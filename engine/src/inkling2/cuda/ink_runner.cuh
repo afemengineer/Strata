@@ -430,7 +430,9 @@ struct InkCudaModel {
             size_t max_body_all = 0;
             for (const auto& e : dir) max_body_all = std::max<size_t>(max_body_all, e.body_bytes);
             const size_t pf_bytes = 2 * InkHybridEngine::pf_stage_size(max_body_all);
-            const size_t hyb_post_res = std::max(reserve, (size_t)(1408ull << 20) + wddm_floor / 2);
+            size_t hyb_post_res = std::max(reserve, (size_t)(1408ull << 20) + wddm_floor / 2);
+            // Experiment: override the post-load headroom so spare VRAM holds experts instead of sitting idle.
+            if (const char* e = std::getenv("STRATA_INK_HYB_POST_RES_MIB")) hyb_post_res = (size_t)std::atoll(e) << 20;
             const size_t hyb_reserve = hyb_post_res + pf_bytes + (64ull << 20);
             size_t vram_budget = (vfree > hyb_reserve) ? (vfree - hyb_reserve) : 0;
             if (user_vram_cap < vram_budget) vram_budget = user_vram_cap;
