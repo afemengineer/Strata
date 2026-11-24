@@ -267,6 +267,7 @@ public:
         snap_p0_.assign(max_slots_, 0);
         snap_M_.assign(max_slots_, 0);
         prompt_ckpts_.assign(max_slots_, PromptCkpt{});
+        pin_ckpts_.assign(max_slots_, PromptCkpt{});
         initialized_ = true;
         return true;
     }
@@ -286,6 +287,7 @@ public:
             slot_alloc_[slot] = false;
             snap_active_[slot] = false;
             if (slot < (int)prompt_ckpts_.size()) prompt_ckpts_[slot] = PromptCkpt{};
+            if (slot < (int)pin_ckpts_.size()) pin_ckpts_[slot] = PromptCkpt{};
             if (slot == 0) tree_snap_ready_ = false;
         }
     }
@@ -295,15 +297,24 @@ public:
         runner_->reset_slot(slot);
         snap_active_[slot] = false;
         if (slot < (int)prompt_ckpts_.size()) prompt_ckpts_[slot].valid = false;
+        if (slot < (int)pin_ckpts_.size()) pin_ckpts_[slot].valid = false;  // its global KV is about to be overwritten
         if (slot == 0) { dspark_slot_ = -1; tree_snap_ready_ = false; }
     }
 
     // #6627: Save/restore slot's ShortConv (3.83 MB) + 40 SWA KV ring windows (<=160 MiB in host RAM) + DSpark SWA KV
     // so multi-turn chats and exact repeats reuse the full prior prompt even if hidden thinking or trailing tokens diverged!
-    bool save_prompt_checkpoint(int slot, int seq_len) override {
+    bool save_prompt_checkpoint(int slot, int seq_len) override { return save_ckpt(slot, seq_len, 0); }
+    bool save_pin_checkpoint(int slot, int seq_len) override { return save_ckpt(slot, seq_len, 1); }
+    bool restore_prompt_checkpoint(int slot, int seq_len) override { return restore_ckpt(slot, seq_len, 0); }
+    bool restore_pin_checkpoint(int slot, int seq_len) override { return restore_ckpt(slot, seq_len, 1); }
+
+    // which = 0: the prompt-end checkpoint; 1: the pinned prefix checkpoint.
+    bool save_ckpt(int slot, int seq_len, int which) {
         if (!initialized_ || slot < 0 || slot >= max_slots_ || model_.ls_active || !d_sconv_snap_) return false;
         if (seq_len <= 0 || max_slots_ > 8) return false;
-        auto& ck = prompt_ckpts_[slot];
+        auto& store = which ? pin_ckpts_ : prompt_ckpts_;
+        if (slot >= (int)store.size()) return false;
+        auto& ck = store[slot];
         ck.valid = false;
         ck.seq_len = seq_len;
         // 1. Copy 48-visit ShortConv state via d_sconv_snap_ -> host RAM (3.83 MB)
@@ -385,10 +396,11 @@ public:
         return true;
     }
 
-    bool restore_prompt_checkpoint(int slot, int seq_len) override {
+    bool restore_ckpt(int slot, int seq_len, int which) {
         if (!initialized_ || slot < 0 || slot >= max_slots_ || model_.ls_active || !d_sconv_snap_) return false;
-        if (slot >= (int)prompt_ckpts_.size()) return false;
-        const auto& ck = prompt_ckpts_[slot];
+        const auto& store = which ? pin_ckpts_ : prompt_ckpts_;
+        if (slot >= (int)store.size()) return false;
+        const auto& ck = store[slot];
         if (!ck.valid || ck.seq_len != seq_len) return false;
         snap_active_[slot] = false;
         if (slot == 0) tree_snap_ready_ = false;
@@ -910,6 +922,7 @@ private:
         if (h_logits_pin_) { cudaFreeHost(h_logits_pin_); h_logits_pin_ = nullptr; h_logits_cap_ = 0; }
         model_.free_all();
         prompt_ckpts_.clear();
+        pin_ckpts_.clear();
         initialized_ = false;
     }
 
@@ -946,6 +959,7 @@ private:
     std::vector<int> snap_p0_;
     std::vector<int> snap_M_;
     std::vector<PromptCkpt> prompt_ckpts_;
+    std::vector<PromptCkpt> pin_ckpts_;  // pinned shared-prefix checkpoints (pin=N), one per slot
     bool tree_snap_ready_ = false;
     int tree_snap_p0_ = 0;
     int tree_snap_M_ = 0;

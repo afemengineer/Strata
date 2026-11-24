@@ -253,6 +253,7 @@ struct ParsedGen {
     std::vector<std::string> images;
     bool prefill_only = false;
     bool slot_read = false;
+    int pin = 0;          // pin=N: the first N prompt tokens are a prefix shared across conversations (strata_prefix)
 };
 
 inline bool parse_id_list(const std::string& s, std::vector<int32_t>& out, std::string& err) {
@@ -323,6 +324,7 @@ inline bool parse_gen_cmd(const std::string& line, ParsedGen& r, std::string& er
         else if (key == "seed") r.s.seed = std::strtoull(val.c_str(), nullptr, 10);
         else if (key == "prefill") r.prefill_only = (d != 0.0);
         else if (key == "slot_read") r.slot_read = (d != 0.0);
+        else if (key == "pin") r.pin = std::max(0, static_cast<int>(d));
         else if (key == "image") r.images.push_back(pct_decode(val));
         else if (key == "hold") {
             size_t col = val.find(':');
@@ -418,6 +420,9 @@ struct ActiveReq {
     std::vector<int32_t> gen_ids;
     std::vector<int32_t> cached_prefix;       // tokens currently resident in slot KV
     std::vector<int32_t> prompt_ckpt_prefix;  // prompt-end checkpoint prefix saved before generation (#6627)
+    std::vector<int32_t> pin_prefix;          // the slot's pinned prefix checkpoint (pin=N), kept across conversations
+    bool pin_pending = false;                 // true while prefilling up to pin_pos to save the pinned checkpoint
+    int pin_pos = 0;
     int reused_tokens = 0;                    // prefix tokens reused for this request
     bool ckpt_pending = false;                // true while prefilling up to ckpt_pos to save checkpoint
     int ckpt_pos = 0;                         // where the prompt checkpoint is saved (see prompt_ckpt_pos)
@@ -604,25 +609,44 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                 while (m < plen && rq.prompt_ckpt_prefix[m] == rq.prompt_ids[m]) ++m;
                 if (m == plen) ckpt_match = plen;
             }
-            if (full_match > 0 && full_match >= ckpt_match) {
+            // The pinned prefix (pin=N) is the state after a prefix that every conversation of a client starts with.
+            const int plen = static_cast<int>(rq.pin_prefix.size());
+            const bool pin_ok = plen > 0 && plen < rq.prompt_len &&
+                                std::equal(rq.pin_prefix.begin(), rq.pin_prefix.end(), rq.prompt_ids.begin());
+            const int pin_match = pin_ok ? plen : 0;
+            if (full_match > 0 && full_match >= ckpt_match && full_match >= pin_match) {
                 reuse = full_match;
-            } else if (ckpt_match > 0 && backend.restore_prompt_checkpoint(rq.slot, ckpt_match)) {
+            } else if (ckpt_match > 0 && ckpt_match >= pin_match && backend.restore_prompt_checkpoint(rq.slot, ckpt_match)) {
                 reuse = ckpt_match;
                 rq.cached_prefix = rq.prompt_ckpt_prefix;
                 used_ckpt = true;
+            } else if (pin_match > 0 && backend.restore_pin_checkpoint(rq.slot, pin_match)) {
+                // A new conversation: the prompt checkpoint's tokens past the prefix are about to be overwritten.
+                reuse = pin_match;
+                rq.cached_prefix = rq.pin_prefix;
+                rq.prompt_ckpt_prefix.clear();
+                used_ckpt = true;
             }
+            // Prefilling from `reuse` overwrites the pinned prefix's positions unless the prompt starts with it.
+            if (plen > 0 && !pin_ok && reuse < plen) rq.pin_prefix.clear();
         }
         (void)used_ckpt;
         if (reuse == 0) {
             backend.reset_slot(rq.slot);
             rq.cached_prefix.clear();
             rq.prompt_ckpt_prefix.clear();
+            rq.pin_prefix.clear();
         } else {
             proto("RESUME %d", reuse);
         }
         rq.reused_tokens = reuse;
         rq.ckpt_pos = prompt_ckpt_pos(rq.prompt_ids, c.message_model_token_id);
         rq.ckpt_pending = (pg.images.empty() && rq.prompt_len >= 16 && reuse < rq.ckpt_pos);
+        rq.pin_pos = (pg.images.empty() && pg.pin > 0 && pg.pin < rq.ckpt_pos) ? pg.pin : 0;
+        rq.pin_pending = rq.pin_pos > reuse;
+        if (std::getenv("STRATA_INK_PIN_DEBUG"))
+            std::fprintf(stderr, "[pin] slot=%d cmd=%s pin=%d prompt=%d reuse=%d pin_prefix=%zu ckpt_pos=%d pending=%d\n", rq.slot,
+                         pg.cmd.c_str(), pg.pin, rq.prompt_len, reuse, rq.pin_prefix.size(), rq.ckpt_pos, (int)rq.pin_pending);
         rq.prefill_pos = reuse;
         rq.cur_pos = reuse;
         rq.hist = rq.prompt_ids;
@@ -850,6 +874,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                         // Never leave poisoned KV/ShortConv prefix cached across retries (#879)!
                         rq.cached_prefix.clear();
                         rq.prompt_ckpt_prefix.clear();
+                        rq.pin_prefix.clear();
                         backend.reset_slot(rq.slot);
                         finish_req(rq, "nonfinite");
                         done = true;
@@ -930,6 +955,9 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                     if (rq.ckpt_pending && rq.prefill_pos < rq.ckpt_pos && rq.prefill_pos + take > rq.ckpt_pos) {
                         take = rq.ckpt_pos - rq.prefill_pos;
                     }
+                    if (rq.pin_pending && rq.prefill_pos < rq.pin_pos && rq.prefill_pos + take > rq.pin_pos) {
+                        take = rq.pin_pos - rq.prefill_pos;
+                    }
                     const int img_base = static_cast<int>(merged_img_embeds.size()) / c.hidden;
                     if (!rq.img_embeds.empty()) {
                         merged_img_embeds.insert(merged_img_embeds.end(), rq.img_embeds.begin(), rq.img_embeds.end());
@@ -965,6 +993,14 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                 rq.prefill_pos += prefill_fed[s];
                 rq.cur_pos = rq.prefill_pos;
                 rq.prompt_ms += step_ms;
+                if (rq.pin_pending && rq.prefill_pos == rq.pin_pos) {
+                    rq.pin_pending = false;
+                    if (backend.save_pin_checkpoint(rq.slot, rq.prefill_pos)) {
+                        rq.pin_prefix.assign(rq.prompt_ids.begin(), rq.prompt_ids.begin() + rq.prefill_pos);
+                    }
+                    if (std::getenv("STRATA_INK_PIN_DEBUG"))
+                        std::fprintf(stderr, "[pin] saved slot=%d at %d: %zu\n", rq.slot, rq.prefill_pos, rq.pin_prefix.size());
+                }
                 if (rq.ckpt_pending && rq.prefill_pos == rq.ckpt_pos) {
                     rq.ckpt_pending = false;
                     if (backend.save_prompt_checkpoint(rq.slot, rq.prefill_pos)) {

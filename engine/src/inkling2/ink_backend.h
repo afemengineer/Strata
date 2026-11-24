@@ -78,6 +78,17 @@ public:
         (void)slot; (void)seq_len;
         return false;
     }
+    // Optional pinned prefix checkpoint (the server's `pin=N`, from a request's "strata_prefix"): the same state at the end
+    // of a prefix that many conversations share (a client's static system prompt and tools), kept beside the prompt
+    // checkpoint so a new conversation reads only what follows the prefix.
+    virtual bool save_pin_checkpoint(int slot, int seq_len) {
+        (void)slot; (void)seq_len;
+        return false;
+    }
+    virtual bool restore_pin_checkpoint(int slot, int seq_len) {
+        (void)slot; (void)seq_len;
+        return false;
+    }
 
     // Returns true when the on-device DSpark drafter is initialized and ready to serve drafts (#6633).
     virtual bool dspark_ready() const { return false; }

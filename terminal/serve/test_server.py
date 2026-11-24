@@ -1792,6 +1792,15 @@ class SharedPrefix(unittest.TestCase):
                        {"strata_prefix": {"tokens": True}}, {"strata_prefix": "x"}):
             self.assertFalse([k for k in self.keys(**absent) if k.startswith("pin=")], absent)
 
+    def test_pin_key_for_inkling(self):
+        # The Inkling-2-Mini engine takes pin=N like the others; its other Strata-only keys stay stripped.
+        keys = StrataEngine.sampling_keys({"strata_prefix": {"tokens": 9080}, "strata_tune": {"pcie_frac": 0.5}},
+                                          inkling=True).split()
+        self.assertIn("pin=9080", keys)
+        self.assertFalse([k for k in keys if k.startswith("pcie_frac=")])
+        self.assertFalse([k for k in StrataEngine.sampling_keys({"strata_prefix": {"tokens": 9080}}, hy4=True).split()
+                          if k.startswith("pin=")])
+
     def test_messages_resolve_to_the_boundary_token(self):
         req = {"strata_prefix": {"messages": 2}}
         ids, _, _ = self.svc.prepare(self.MSGS, None, {}, 16, req=req)

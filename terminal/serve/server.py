@@ -1366,6 +1366,13 @@ class StrataEngine:
                 keys += " image=" + hy4_kind.encode_path(p)
             for p in sampling.get("strata_inkling_images") or []:
                 keys += " image=" + inkling_kind.encode_path(p)
+            # Inkling-2-Mini keeps a pinned checkpoint at a shared prefix ("strata_prefix" -> pin=N), so conversations
+            # that start with the same system prompt and tools read only what follows it.
+            prefix = sampling.get("strata_prefix")
+            if inkling and isinstance(prefix, dict):
+                pn = prefix.get("tokens")
+                if isinstance(pn, int) and not isinstance(pn, bool) and pn > 0:
+                    keys += f" pin={pn}"
             return keys
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune = sampling.get("strata_tune")
