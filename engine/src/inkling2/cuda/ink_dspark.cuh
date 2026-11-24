@@ -1275,7 +1275,10 @@ struct InkDSpark {
         const bool pack_ho = (cache_is_fp16 || m.tinfo(ho_w).fmt != FMT_BF16);
         if (pack_rn) tot_elems += (size_t)m.tinfo(rn_w).rows() * m.tinfo(rn_w).cols();
         if (pack_ho) tot_elems += (size_t)m.tinfo(ho_w).rows() * m.tinfo(ho_w).cols();
-        if (m.sm_cc >= 70 && vfree > tot_elems * 2 + (768ull << 20)) {
+        // sm_80+: k_ink_sk_mma runs the S_K layers directly at 8 rows, faster than a BF16 copy (3x the bytes) and
+        // without its VRAM (508 MB on SQ-10).
+        const bool sk_mma = m.sm_cc >= 80 && !(std::getenv("STRATA_INK_SK_MMA") && std::getenv("STRATA_INK_SK_MMA")[0] == '0');
+        if (m.sm_cc >= 70 && !sk_mma && vfree > tot_elems * 2 + (768ull << 20)) {
             d_bf16_pool = dalloc<uint16_t>(tot_elems);
             size_t cur = 0;
             for (int il = 0; il < 3; ++il) {
@@ -1323,6 +1326,14 @@ struct InkDSpark {
                 cur += (size_t)m.tinfo(ho_w).rows() * m.tinfo(ho_w).cols();
             }
             INK_CK(cudaStreamSynchronize(r.st));
+        }
+        // Experiment: what the drafter keeps in VRAM and in which formats.
+        if (std::getenv("STRATA_INK_SPEC_STATS")) {
+            const auto& f0 = m.tinfo("dspark.layers.0.mlp.gate_proj.weight");
+            const auto& f1 = m.tinfo("dspark.layers.0.mlp.down_proj.weight");
+            const auto& f2 = m.tinfo("dspark.layers.0.self_attn.q_proj.weight");
+            std::fprintf(stderr, "[dspark] bf16 pool %s (%.0f MB needed, %.0f MB free) fmt gate=%d down=%d q=%d K_cand=%d\n",
+                         d_bf16_pool ? "on" : "off", tot_elems * 2 / 1048576.0, vfree / 1048576.0, (int)f0.fmt, (int)f1.fmt, (int)f2.fmt, K_cand);
         }
         // On Volta sm_70 (V100 32GB, lacks hardware dp4a), pre-pack FP16 unembed [V_pad, 2304] (~604 MB) when >2 GiB free
         // Pad V to multiple of 8 so Volta sm_70 cuBLAS engages 125 TFLOPS FP16 Tensor Cores (~0.67 ms vs 4.6 ms)!
@@ -1476,7 +1487,20 @@ struct InkDSpark {
     }
 
     // Shared 3-layer Block-8 DSpark transformer + Top-K_cand screening (captured in both draft_graph and beam_graph!)
+    bool dprof_on = false;
+    long dprof_n = 0;
+    double dprof_ms[8] = {};
+    std::chrono::steady_clock::time_point dprof_t;
+    void dprof_mark(int idx) {
+        if (!dprof_on) return;
+        INK_CK(cudaStreamSynchronize(r.st));
+        const auto t = std::chrono::steady_clock::now();
+        if (idx >= 0) dprof_ms[idx] += std::chrono::duration<double, std::milli>(t - dprof_t).count();
+        dprof_t = t;
+    }
+
     void emit_dspark_backbone() {
+        dprof_mark(-1);
         const int B = kInkDsparkBlock;  // 8
         const auto& ei = m.tinfo("model.llm.embed.weight");
         k_ink_embed_norm<<<1, 256, 0, r.st>>>(
@@ -1485,6 +1509,7 @@ struct InkDSpark {
             d_anchor_id, nullptr, nullptr, d_cur, 1, kInkHidden);
         const float* mask_e = (const float*)m.trunk_ptr("dspark.mask_embed");
         k_dspark_fill_mask<<<B - 1, 256, 0, r.st>>>(mask_e, d_cur, B);
+        dprof_mark(0);
 
         // 2. 3 non-causal block-attention layers (Fused QKV + Fused GU cuBLAS BF16 Tensor Cores -> < 0.85 ms total!)
         for (int il = 0; il < 3; ++il) {
@@ -1521,6 +1546,7 @@ struct InkDSpark {
             }
             dspark_linear_b8(p + ".mlp.down_proj.weight", d_act, d_proj, B, false);
             k_ink_add<<<(B * kInkHidden + 255) / 256, 256, 0, r.st>>>(d_cur, d_cur, d_proj, B * kInkHidden);
+            dprof_mark(1 + il);
         }
 
         // 3. Final norm + ultra-fast dp4a INT8 base logits (~0.30 ms!) + 896-CTA 2-stage Top-512 (~0.03 ms!)
@@ -1554,6 +1580,7 @@ struct InkDSpark {
         }
         k_dspark_top_cand_s1<<<dim3(128, 7), 256, 0, r.st>>>(base_logits_7, V, d_top_tmp_ids, d_top_tmp_vals, base_ld);
         k_dspark_top_cand_s2<<<7, 256, 0, r.st>>>(d_top_tmp_ids, d_top_tmp_vals, K_cand, d_cand_ids, d_cand_base);
+        dprof_mark(4);
     }
 
     // Emit full Block-8 draft graph body (100% CUDA-Graph capturable -> < 0.45 ms on RTX 5090!)
@@ -1596,6 +1623,7 @@ struct InkDSpark {
                 d_top2_ids + 2 * s, d_top2_probs + 2 * s);
             prev_ptr = d_top2_ids + 2 * s;
         }
+        dprof_mark(5);
     }
 
     // Emit True W=2..4 Multi-Branch On-GPU Markov Beam Tree Graph (captures ALL 7 beam steps in ONE CUDA Graph!)
@@ -1656,7 +1684,17 @@ struct InkDSpark {
         INK_CK(cudaMemcpyAsync(d_apos,      h_meta_pin + 1, 4, cudaMemcpyHostToDevice, r.st));
         INK_CK(cudaMemcpyAsync(d_pos,       h_meta_pin + 2, B * 4, cudaMemcpyHostToDevice, r.st));
 
-        if (r.use_cuda_graph) {
+        static const bool dprof = std::getenv("STRATA_INK_DSPARK_PROF") != nullptr;
+        if (dprof) {
+            // Experiment: eager draft with a sync after each part (backbone layers, base logits + candidates, Markov loop).
+            dprof_on = true;
+            emit_draft_block8();
+            dprof_on = false;
+            if (++dprof_n % 32 == 0) {
+                std::fprintf(stderr, "[dspark-prof] ms/draft: embed=%.2f l0=%.2f l1=%.2f l2=%.2f cand=%.2f markov=%.2f\n",
+                             dprof_ms[0] / dprof_n, dprof_ms[1] / dprof_n, dprof_ms[2] / dprof_n, dprof_ms[3] / dprof_n, dprof_ms[4] / dprof_n, dprof_ms[5] / dprof_n);
+            }
+        } else if (r.use_cuda_graph) {
             if (!draft_graph) {
                 cudaGraph_t gr = nullptr;
                 cudaError_t ce = cudaStreamBeginCapture(r.st, cudaStreamCaptureModeThreadLocal);

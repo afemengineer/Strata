@@ -181,8 +181,11 @@ public:
                                   + (size_t)strata::ink::kInkVisits * max_slots_ * 3 * strata::ink::kInkSconvCh * 4
                                   + (size_t)8 * max_slots_ * init_glob * per_visit_pos;
         // Include O(1) prefill ws (~114 MiB) + DSpark (~224 MiB when enabled) + activation ws (WDDM floor added inside loader!)
-        const bool build_screen = opts.enable_dspark && mf.m.dspark.present;
-        const size_t dspark_pad = build_screen ? (224ull << 20) : 0ull;
+        const bool dspark_on = opts.enable_dspark && mf.m.dspark.present;
+        // Experiment (STRATA_INK_SCREEN=0): no int8 unembed screen (461 MB on SQ-10). The drafter then scores its
+        // candidates on the S6_K unembed itself, and the greedy tree head computes full logits.
+        const bool build_screen = dspark_on && !(std::getenv("STRATA_INK_SCREEN") && std::getenv("STRATA_INK_SCREEN")[0] == '0');
+        const size_t dspark_pad = dspark_on ? (224ull << 20) : 0ull;
         const size_t ws_pad = ((max_slots_ >= 8) ? (1280ull << 20)
                              : ((prop.totalGlobalMem >= (20ull << 30)) ? (960ull << 20)
                               : (prop.totalGlobalMem <= (13ull << 30)) ? (512ull << 20)
@@ -735,8 +738,26 @@ public:
         if (!runner_->ensure_global_kv_cap(anchor_pos + 8) || !dspark_->ensure_ctx_cap(anchor_pos + 8)) return 0;
         int32_t ids7[8] = {};
         float conf7[8] = {};
+        // Experiment (STRATA_INK_SPEC_STATS=N): the draft alone, after the queued work has finished.
+        static const int dstats = std::getenv("STRATA_INK_SPEC_STATS") ? std::atoi(std::getenv("STRATA_INK_SPEC_STATS")) : 0;
+        static double d_wait = 0, d_draft = 0; static long d_n = 0;
+        const auto d0 = std::chrono::steady_clock::now();
+        if (dstats) INK_CK(cudaStreamSynchronize(runner_->st));
+        const auto d1 = std::chrono::steady_clock::now();
         dspark_->draft_block8(anchor_tok, anchor_pos, ids7, conf7);
-        const int cap = std::max(0, std::min(7, max_draft));
+        if (dstats) {
+            d_wait += std::chrono::duration<double>(d1 - d0).count();
+            d_draft += std::chrono::duration<double>(std::chrono::steady_clock::now() - d1).count();
+            if (++d_n % dstats == 0) std::fprintf(stderr, "[draft-stats] n=%ld queued-work=%.2f draft=%.2f ms\n", d_n, 1e3 * d_wait / d_n, 1e3 * d_draft / d_n);
+        }
+        int cap = std::max(0, std::min(7, max_draft));
+        // Experiment (STRATA_INK_DRAFT_N=k): draft exactly k tokens (no adaptive length).
+        static const int fixed_n = std::getenv("STRATA_INK_DRAFT_N") ? std::atoi(std::getenv("STRATA_INK_DRAFT_N")) : 0;
+        if (fixed_n > 0) {
+            cap = std::min(cap, fixed_n);
+            for (int i = 0; i < cap; ++i) out_draft_ids[i] = ids7[i];
+            return cap;
+        }
         if (cap <= 0) return 0;
         // Sparse-MoE Bayes-Optimal Adaptive Draft Length (128 experts, Top-8):
         // Pick nd in [2..cap] maximizing expected emitted tokens / (1 + 4.2 * (1 - (15/16)^(nd+1)))!

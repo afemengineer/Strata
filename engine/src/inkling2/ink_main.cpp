@@ -128,6 +128,12 @@ static int cmd_selfcheck(const std::string& model_path, bool force_cpu, bool ver
     return 0;
 }
 
+// Experiment: bench on a real prompt (--bench-ids FILE, comma-separated ids) and the server's sampling path
+// (--bench-temp T > 0: DSpark drafts a block and rejection-samples like ink_serve.h). --bench-out FILE keeps the ids.
+static std::vector<int32_t> g_bench_ids;
+static float g_bench_temp = 0.0f;
+static std::string g_bench_out;
+
 static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, int prompt_len, int gen_len, bool force_cpu, bool use_dspark) {
     InkModelFile mf;
     std::string err;
@@ -135,6 +141,7 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
         fprintf(stderr, "open: %s\n", err.c_str());
         return 1;
     }
+    if (!g_bench_ids.empty()) prompt_len = (int)g_bench_ids.size();
     BackendOpts bo = bopts;
     bo.enable_dspark = use_dspark;
     if (prompt_len + gen_len > bo.max_ctx) {
@@ -176,7 +183,7 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
         for (int s = 0; s < P; ++s) {
             for (int k = 0; k < len; ++k) {
                 bool is_last = (p0 + k == prompt_len - 1);
-                batch.push(s, p0 + k, 100 + ((s * 31 + p0 + k) % 1000), is_last);
+                batch.push(s, p0 + k, g_bench_ids.empty() ? 100 + ((s * 31 + p0 + k) % 1000) : g_bench_ids[p0 + k], is_last);
             }
         }
         if (!backend->forward_batch(batch, (p0 + len == prompt_len) ? logits.data() : nullptr, nullptr, err)) {
@@ -192,26 +199,74 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
         next_tok[s] = best;
     }
 
+    SampleOpts so;
+    so.temperature = g_bench_temp;
+    std::mt19937_64 rng(1234);
+    std::vector<int32_t> hist, gen_ids;
+    const bool real = !g_bench_ids.empty();
+    auto stop_tok = [&](int32_t t) { return real && (t == mf.m.c.eos_token_id || t == mf.m.c.eot_token_id); };
+    if (P == 1 && so.temperature > 0.0f) next_tok[0] = sample_logits(logits.data(), V, so, hist, rng);
     double t_dec0 = now_s();
     int total_gen = 0, n_spec_steps = 0, n_spec_tok = 0;
+    double t_draft = 0, t_fwd = 0, t_samp = 0;
+    int nd_hist[9] = {}, acc_hist[9] = {};
     if (use_dspark && P == 1) {
         int cur_pos = prompt_len;
         SpecGate gate;  // the server's choice between drafting and plain steps (ink_spec_gate.h)
-        while (total_gen < gen_len && cur_pos < eff_ctx) {
+        bool stopped = false;
+        while (!stopped && total_gen < gen_len && cur_pos < eff_ctx) {
             const int rem = std::min(gen_len - total_gen, eff_ctx - cur_pos);
-            if (rem >= 2 && cur_pos + 12 < eff_ctx && gate.want_spec()) {
+            static const bool bench_plain = std::getenv("STRATA_BENCH_PLAIN") != nullptr;  // DSpark loaded, never drafts
+            if (!bench_plain && rem >= 2 && cur_pos + 12 < eff_ctx && gate.want_spec()) {
                 const double t_s0 = now_s();
-                int32_t emitted[16]{};
-                int drafted = 0;
-                const int n_emit = backend->dspark_spec_step_greedy(
-                    0, next_tok[0], cur_pos, rem, emitted, &drafted, err);
-                if (n_emit < 0) { fprintf(stderr, "bench spec err: %s\n", err.c_str()); return 1; }
-                if (n_emit > 0) {
-                    next_tok[0] = emitted[n_emit - 1];
-                    cur_pos += n_emit;
-                    total_gen += n_emit; ++n_spec_steps; n_spec_tok += n_emit;
-                    gate.on_spec(now_s() - t_s0, n_emit);
-                    continue;
+                if (so.temperature <= 0.0f) {
+                    int32_t emitted[16]{};
+                    int drafted = 0;
+                    const int n_emit = backend->dspark_spec_step_greedy(
+                        0, next_tok[0], cur_pos, rem, emitted, &drafted, err);
+                    if (n_emit < 0) { fprintf(stderr, "bench spec err: %s\n", err.c_str()); return 1; }
+                    if (n_emit > 0) {
+                        for (int i = 0; i < n_emit; ++i) { gen_ids.push_back(emitted[i]); if (stop_tok(emitted[i])) stopped = true; }
+                        next_tok[0] = emitted[n_emit - 1];
+                        cur_pos += n_emit;
+                        total_gen += n_emit; ++n_spec_steps; n_spec_tok += n_emit;
+                        ++acc_hist[std::min(8, n_emit)];
+                        gate.on_spec(now_s() - t_s0, n_emit);
+                        continue;
+                    }
+                } else {
+                    int32_t draft_ids[8]{};
+                    const int max_d = std::min(7, rem - 1);
+                    const int nd = backend->dspark_draft(0, next_tok[0], cur_pos, max_d, draft_ids, err);
+                    const double t_s1 = now_s();
+                    if (nd > 0) {
+                        backend->snapshot_slot(0);
+                        batch.clear();
+                        batch.capture_taps = true;
+                        batch.push(0, cur_pos, next_tok[0], true);
+                        for (int i = 0; i < nd; ++i) batch.push(0, cur_pos + 1 + i, draft_ids[i], true);
+                        std::vector<float> lgb((size_t)(nd + 1) * V);
+                        if (!backend->forward_batch(batch, lgb.data(), nullptr, err)) { fprintf(stderr, "bench verify err: %s\n", err.c_str()); return 1; }
+                        const double t_s2 = now_s();
+                        int accepted = 0;
+                        for (int i = 0; i <= nd; ++i) {
+                            float* lg = lgb.data() + (size_t)i * V;
+                            bool ok = false;
+                            const int32_t tok = (i < nd) ? verify_draft_logits(lg, V, so, hist, rng, draft_ids[i], ok)
+                                                         : sample_logits(lg, V, so, hist, rng);
+                            hist.push_back(tok); gen_ids.push_back(tok); ++accepted;
+                            if (stop_tok(tok)) { stopped = true; break; }
+                            if (!(i < nd && ok)) { next_tok[0] = tok; break; }
+                        }
+                        if (accepted <= nd) backend->rollback_slot(0, cur_pos + accepted);
+                        cur_pos += accepted;
+                        total_gen += accepted; ++n_spec_steps; n_spec_tok += accepted;
+                        ++nd_hist[nd]; ++acc_hist[std::min(8, accepted)];
+                        const double t_s3 = now_s();
+                        t_draft += t_s1 - t_s0; t_fwd += t_s2 - t_s1; t_samp += t_s3 - t_s2;
+                        gate.on_spec(t_s3 - t_s0, accepted);
+                        continue;
+                    }
                 }
             }
             const double t_p0 = now_s();
@@ -222,14 +277,38 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
                 fprintf(stderr, "bench decode err: %s\n", err.c_str());
                 return 1;
             }
-            int32_t best = 0;
-            for (int i = 1; i < V; ++i) if (logits[i] > logits[best]) best = i;
-            next_tok[0] = best;
+            next_tok[0] = sample_logits(logits.data(), V, so, hist, rng);
+            hist.push_back(next_tok[0]); gen_ids.push_back(next_tok[0]);
+            if (stop_tok(next_tok[0])) stopped = true;
             ++total_gen;
             gate.on_plain(now_s() - t_p0);
         }
         fprintf(stderr, "[bench] spec-gate: %.1f tok/s drafting (%.2f tokens/step), %.1f tok/s plain, %d plain tokens\n",
                 gate.spec_rate(), gate.spec_tokens, gate.plain_rate(), gate.n_plain);
+        if (so.temperature > 0.0f && n_spec_steps > 0) {
+            fprintf(stderr, "[bench] block steps: draft=%.2f verify=%.2f sample=%.2f ms/step | drafted 1..7:", 1e3 * t_draft / n_spec_steps, 1e3 * t_fwd / n_spec_steps, 1e3 * t_samp / n_spec_steps);
+            for (int k = 1; k <= 7; ++k) fprintf(stderr, " %d", nd_hist[k]);
+            fprintf(stderr, " |");
+        } else if (n_spec_steps > 0) fprintf(stderr, "[bench] tree steps |");
+        if (n_spec_steps > 0) {
+            fprintf(stderr, " emitted 1..8:");
+            for (int k = 1; k <= 8; ++k) fprintf(stderr, " %d", acc_hist[k]);
+            fprintf(stderr, "\n");
+        }
+    } else if (P == 1) {
+        for (int step = 0; step < gen_len; ++step) {
+            batch.clear();
+            batch.capture_taps = use_dspark;
+            batch.push(0, prompt_len + step, next_tok[0], true);
+            if (!backend->forward_batch(batch, logits.data(), nullptr, err)) {
+                fprintf(stderr, "bench decode err: %s\n", err.c_str());
+                return 1;
+            }
+            next_tok[0] = sample_logits(logits.data(), V, so, hist, rng);
+            hist.push_back(next_tok[0]); gen_ids.push_back(next_tok[0]);
+            ++total_gen;
+            if (stop_tok(next_tok[0])) break;
+        }
     } else {
         for (int step = 0; step < gen_len; ++step) {
             batch.clear();
@@ -249,6 +328,12 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
         }
     }
     double dec_s = now_s() - t_dec0;
+    if (!g_bench_out.empty()) {
+        if (FILE* fo = std::fopen(g_bench_out.c_str(), "w")) {
+            for (size_t i = 0; i < gen_ids.size(); ++i) std::fprintf(fo, "%s%d", i ? "," : "", gen_ids[i]);
+            std::fclose(fo);
+        }
+    }
     if (n_spec_steps > 0) fprintf(stderr, "[bench] dspark: %d steps, %d tokens (%.2f per step), %.1f ms per step\n", n_spec_steps, n_spec_tok, (double)n_spec_tok / n_spec_steps, 1000.0 * dec_s / n_spec_steps);
     double ppts = (P * prompt_len) / std::max(pf_s, 1e-9);
     double tps_agg = total_gen / std::max(dec_s, 1e-9);
@@ -488,6 +573,15 @@ int main(int argc, char** argv) {
             bench_prompt = std::atoi(next().c_str());
         } else if (a == "--gen") {
             bench_gen = std::atoi(next().c_str());
+        } else if (a == "--bench-ids") {
+            std::ifstream fi(next());
+            std::string txt((std::istreambuf_iterator<char>(fi)), std::istreambuf_iterator<char>());
+            std::string e2;
+            if (!parse_id_list(txt, g_bench_ids, e2)) { fprintf(stderr, "--bench-ids: %s\n", e2.c_str()); return 2; }
+        } else if (a == "--bench-temp") {
+            g_bench_temp = static_cast<float>(std::atof(next().c_str()));
+        } else if (a == "--bench-out") {
+            g_bench_out = next();
         } else if (a == "--prompt-ids") {
             prompt_ids_str = next();
         } else if (a == "--temp") {

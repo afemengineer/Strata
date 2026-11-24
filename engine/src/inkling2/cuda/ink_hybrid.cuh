@@ -1378,12 +1378,27 @@ struct InkHybridEngine {
             G.ys[0] = const_cast<float*>(h_bell->y[cur_slot_k[j]]);
             split_push_rows(ns++);
         }
+        const auto dt0 = std::chrono::steady_clock::now();
         run_tasks_parallel((int)sp_tasks.size());
+        const auto dt1 = std::chrono::steady_clock::now();
         run_split_down(ns);
+        if (stats_every > 0) {
+            // Experiment: the same phase times for single tokens.
+            static double a = 0, b = 0, by = 0; static long n = 0, grs = 0;
+            const auto dt2 = std::chrono::steady_clock::now();
+            a += std::chrono::duration<double>(dt1 - dt0).count();
+            b += std::chrono::duration<double>(dt2 - dt1).count();
+            for (int gi = 0; gi < ns; ++gi) by += (double)sp_groups[gi].hm->body_bytes;
+            grs += ns;
+            if (++n % 960 == 0)
+                std::fprintf(stderr, "[cpu-split1] experts/ring=%.2f MB/expert=%.2f ms/ring: gate-up=%.3f down=%.3f -> %.1f GB/s\n",
+                             (double)grs / n, by / grs / 1e6, 1e3 * a / n, 1e3 * b / n, by / (a + b) / 1e9);
+        }
     }
 
     // M=2..16 verify: groups verify_groups[0, ng) of `layer`.
     void run_verify_split(int ng) noexcept {
+        const auto vq0 = std::chrono::steady_clock::now();
         split_reserve(ng);
         // Each verify token's activations are quantized once, then copied into every group that uses it.
         sp_tok_done.assign((size_t)v_cap, 0);
@@ -1413,8 +1428,23 @@ struct InkHybridEngine {
             G.xa = xa;
             split_push_rows(ns++);
         }
+        // Experiment (STRATA_INK_HYB_STATS): time of the gate/up and down phases and the weight bytes they read.
+        const auto vt0 = std::chrono::steady_clock::now();
         run_tasks_parallel((int)sp_tasks.size());
+        const auto vt1 = std::chrono::steady_clock::now();
         run_split_down(ns);
+        if (stats_every > 0) {
+            static double a = 0, b = 0, q = 0, by = 0; static long n = 0, toks = 0, grs = 0;
+            const auto vt2 = std::chrono::steady_clock::now();
+            q += std::chrono::duration<double>(vt0 - vq0).count();
+            a += std::chrono::duration<double>(vt1 - vt0).count();
+            b += std::chrono::duration<double>(vt2 - vt1).count();
+            for (int gi = 0; gi < ns; ++gi) { by += (double)sp_groups[gi].hm->body_bytes; toks += sp_groups[gi].T; }
+            grs += ns;
+            if (++n % 192 == 0)
+                std::fprintf(stderr, "[cpu-split] groups/visit=%.1f tok/group=%.2f MB/group=%.2f ms/visit: prep=%.3f gate-up=%.3f down=%.3f -> %.1f GB/s\n",
+                             (double)grs / n, (double)toks / grs, by / grs / 1e6, 1e3 * q / n, 1e3 * a / n, 1e3 * b / n, by / (a + b) / 1e9);
+        }
     }
 
     void run_verify_groups(int layer, int ng) noexcept {

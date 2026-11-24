@@ -1791,6 +1791,228 @@ __global__ void __launch_bounds__(256) k_ink_gemv_s6k_multi(const uint8_t* __res
     }
 }
 
+// Y[m, n] = dot(W_n, X[m]) for an S5_K / S6_K / S8_K matrix [N, K] (K % 256 == 0) and M <= 8 * NT rows of X, on
+// FP16 tensor cores (mma m16n8k16, FP32 accumulation; sm_80+).
+// Measured on an RTX 4060 (SQ-10): the DSpark drafter's three S5_K layers went through sk_to_bf16 + cuBLAS at 8 rows,
+// 1.9 ms a layer, because the whole matrix was written and re-read as BF16 for every draft.
+// Each warp owns 16 rows of W. The A operand holds the integer codes (q - half), which FP16 represents exactly, and
+// each 64-value group's partial sum is scaled by its group scale afterwards, so W loses nothing (the BF16 path rounds
+// W to 8 bits of mantissa). X is split into an FP16 head and an FP16 remainder (two MMAs), which keeps about 22 bits
+// of it. Within a 64-value group, lane (g, t) loads values 16t..16t+15 (contiguous bytes); the B operand uses the
+// same k order, so the MMA sums the right pairs. With gridDim.y > 1, block row y sums superblocks y, y + gridDim.y, ...
+// into Y + y * ldy_split (a later k_ink_sum_splits adds them in a fixed order).
+__device__ __forceinline__ void ink_cp_async4(void* smem, const void* gmem, int src_bytes) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    const unsigned sa = (unsigned)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" ::"r"(sa), "l"(gmem), "r"(src_bytes));
+#else
+    uint32_t v = 0u;
+    for (int b = 0; b < src_bytes; ++b) v |= (uint32_t)reinterpret_cast<const uint8_t*>(gmem)[b] << (8 * b);
+    *reinterpret_cast<uint32_t*>(smem) = v;
+#endif
+}
+__device__ __forceinline__ void ink_cp_async_commit() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+template <int N>
+__device__ __forceinline__ void ink_cp_async_wait() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
+#endif
+}
+
+template <int FMT, int NT>
+__global__ void __launch_bounds__(128) k_ink_sk_mma(const uint8_t* __restrict__ W, const float* __restrict__ X,
+                                                    float* __restrict__ Y, int M, int N, int K, int ldy, size_t ldy_split) {
+    constexpr int SB = ink_sb_bytes(FMT);
+    constexpr int WPR = (SB + 2 + 3) / 4;  // words staged per row segment (segments are only 2-byte aligned)
+    __shared__ uint32_t sm[4][2][16 * WPR];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r0 = (blockIdx.x * 4 + warp) * 16;
+    if (r0 >= N) return;
+    const int gq = lane >> 2, t = lane & 3;
+    const int nsb = K >> 8;
+    const size_t row_bytes = (size_t)nsb * SB;
+    const uint8_t* W_end = W + (size_t)N * row_bytes;
+    const __half2 k1024 = __float2half2_rn(1024.0f);
+    const __half2 khalf = __float2half2_rn(ink_sk_half(FMT));
+    const __half2 k1152 = __float2half2_rn(1152.0f);
+    // Rows of X this lane reads for the B operand (token gq of each 8-token tile); rows past M read row 0 and are dropped.
+    const float* xr[NT];
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) xr[nt] = X + (size_t)((nt * 8 + gq < M) ? (nt * 8 + gq) : 0) * K;
+    float acc[NT][4];
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) acc[nt][0] = acc[nt][1] = acc[nt][2] = acc[nt][3] = 0.0f;
+
+    // Copy superblock s of the warp's 16 rows into stage buffer `st` (whole aligned words; bytes past the end of W
+    // read as zero). Each warp-wide copy covers 128 consecutive bytes, so the weights are read coalesced.
+    auto issue = [&](int s, int st) {
+        uint32_t* dst = sm[warp][st];
+#pragma unroll 4
+        for (int i = lane; i < 16 * WPR; i += 32) {
+            const int r = i / WPR, w = i - r * WPR;
+            const int row = min(r0 + r, N - 1);
+            const uintptr_t a = reinterpret_cast<uintptr_t>(W + (size_t)row * row_bytes + (size_t)s * SB);
+            const uint8_t* src = reinterpret_cast<const uint8_t*>((a & ~(uintptr_t)3) + 4 * w);
+            const int nb = (src + 4 <= W_end) ? 4 : (src < W_end ? (int)(W_end - src) : 0);  // the last word may be partial
+            ink_cp_async4(dst + i, nb ? src : W, nb);
+        }
+        ink_cp_async_commit();
+    };
+    // Low address bits of rows gq and gq + 8; superblock s of a row starts (bits + s * SB) & 3 bytes into its words.
+    auto row_bits = [&](int r) -> int {
+        const int row = min(r0 + r, N - 1);
+        return (int)(reinterpret_cast<uintptr_t>(W + (size_t)row * row_bytes) & 3);
+    };
+    const int oa_row = row_bits(gq), ob_row = row_bits(gq + 8);
+
+    // Two codes (values i0, i0+1 of the lane's 16) as an FP16 pair (q - half), exactly.
+    auto codes = [&](uint32_t pair) -> uint32_t {
+        __half2 h = *reinterpret_cast<__half2*>(&pair);
+        if constexpr (FMT == FMT_S8_K) h = __hsub2(h, k1152);
+        else h = __hsub2(__hsub2(h, k1024), khalf);
+        return *reinterpret_cast<uint32_t*>(&h);
+    };
+    // The lane's 16 values of group g of one row's superblock, as 8 FP16 pairs: pr[2j] = values 4j, 4j+1; pr[2j+1] = 4j+2, 4j+3.
+    auto load16 = [&](const uint8_t* blk, int g, uint32_t (&pr)[8]) {
+        const uint8_t* pl = blk + 6;
+        if constexpr (FMT == FMT_S8_K) {
+            const uint8_t* q = pl + 64 * g + 16 * t;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint32_t w = ld32_u(q + 4 * j) ^ 0x80808080u;  // int8 -> q + 128
+                pr[2 * j]     = codes(0x64006400u | (w & 0xFFu) | ((w & 0xFF00u) << 8));
+                pr[2 * j + 1] = codes(0x64006400u | ((w >> 16) & 0xFFu) | ((w >> 8) & 0xFF0000u));
+            }
+        } else {
+            const uint8_t* q = pl + 32 * g + 8 * t;
+            const uint32_t w0 = ld32_u(q), w1 = ld32_u(q + 4);
+            uint32_t hb;
+            if constexpr (FMT == FMT_S5_K) hb = ld16_u(pl + 128 + 8 * g + 2 * t);
+            else                           hb = ld32_u(pl + 128 + 16 * g + 4 * t);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint32_t seg = ((j < 2) ? (w0 >> (16 * j)) : (w1 >> (16 * (j - 2)))) & 0xFFFFu;
+                uint32_t p0 = (seg & 0xFu) | ((seg & 0xF0u) << 12);
+                uint32_t p1 = ((seg >> 8) & 0xFu) | ((seg & 0xF000u) << 4);
+                if constexpr (FMT == FMT_S5_K) {
+                    const uint32_t h = (hb >> (4 * j)) & 0xFu;
+                    p0 |= ((h & 1u) << 4) | ((h & 2u) << 19);
+                    p1 |= ((h & 4u) << 2) | ((h & 8u) << 17);
+                } else {
+                    const uint32_t h = (hb >> (8 * j)) & 0xFFu;
+                    p0 |= ((h & 3u) << 4) | ((h & 0xCu) << 18);
+                    p1 |= ((h & 0x30u)) | ((h & 0xC0u) << 14);
+                }
+                pr[2 * j]     = codes(0x64006400u | p0);
+                pr[2 * j + 1] = codes(0x64006400u | p1);
+            }
+        }
+    };
+
+    const int n_my = (nsb - (int)blockIdx.y + (int)gridDim.y - 1) / (int)gridDim.y;
+    if (n_my > 0) issue(blockIdx.y, 0);
+    if (n_my > 1) issue(blockIdx.y + gridDim.y, 1);
+    for (int i = 0; i < n_my; ++i) {
+        const int s = blockIdx.y + i * gridDim.y;
+        const int st = i & 1;
+        if (i + 1 < n_my) ink_cp_async_wait<1>();
+        else ink_cp_async_wait<0>();
+        __syncwarp();
+        const uint8_t* ba = reinterpret_cast<const uint8_t*>(sm[warp][st] + gq * WPR) + ((oa_row + s * SB) & 3);
+        const uint8_t* bb = reinterpret_cast<const uint8_t*>(sm[warp][st] + (gq + 8) * WPR) + ((ob_row + s * SB) & 3);
+        const float Da = f16_to_f32(ld16_u(ba)) * (1.0f / 255.0f);
+        const float Db = f16_to_f32(ld16_u(bb)) * (1.0f / 255.0f);
+#pragma unroll
+        for (int g = 0; g < 4; ++g) {
+            uint32_t A[8], B8[8];
+            load16(ba, g, A);
+            load16(bb, g, B8);
+            const int col = s * 256 + 64 * g + 16 * t;
+            float c[NT][4];
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt) {
+                c[nt][0] = c[nt][1] = c[nt][2] = c[nt][3] = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float4 x = *reinterpret_cast<const float4*>(xr[nt] + col + 4 * j);
+                    const __half2 h01 = __floats2half2_rn(x.x, x.y), h23 = __floats2half2_rn(x.z, x.w);
+                    const float2 f01 = __half22float2(h01), f23 = __half22float2(h23);
+                    const __half2 l01 = __floats2half2_rn(x.x - f01.x, x.y - f01.y);
+                    const __half2 l23 = __floats2half2_rn(x.z - f23.x, x.w - f23.y);
+                    const uint32_t bh0 = *reinterpret_cast<const uint32_t*>(&h01), bh1 = *reinterpret_cast<const uint32_t*>(&h23);
+                    const uint32_t bl0 = *reinterpret_cast<const uint32_t*>(&l01), bl1 = *reinterpret_cast<const uint32_t*>(&l23);
+                    // a0a1: row gq, values 4j,4j+1; a2a3: row gq+8, same; a4a5 / a6a7: values 4j+2, 4j+3.
+                    mma_m16n8k16_f16(c[nt], A[2 * j], B8[2 * j], A[2 * j + 1], B8[2 * j + 1], bh0, bh1);
+                    mma_m16n8k16_f16(c[nt], A[2 * j], B8[2 * j], A[2 * j + 1], B8[2 * j + 1], bl0, bl1);
+                }
+            }
+            const float ea = Da * (float)ba[2 + g], eb = Db * (float)bb[2 + g];
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt) {
+                acc[nt][0] = fmaf(c[nt][0], ea, acc[nt][0]);
+                acc[nt][1] = fmaf(c[nt][1], ea, acc[nt][1]);
+                acc[nt][2] = fmaf(c[nt][2], eb, acc[nt][2]);
+                acc[nt][3] = fmaf(c[nt][3], eb, acc[nt][3]);
+            }
+        }
+        __syncwarp();
+        if (i + 2 < n_my) issue(s + 2 * gridDim.y, st);
+    }
+    float* Yo = Y + (size_t)blockIdx.y * ldy_split;
+    const int na = r0 + gq, nb = r0 + gq + 8;
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) {
+        const int m0 = nt * 8 + 2 * t, m1 = m0 + 1;
+        if (m0 < M && na < N) Yo[(size_t)m0 * ldy + na] = acc[nt][0];
+        if (m1 < M && na < N) Yo[(size_t)m1 * ldy + na] = acc[nt][1];
+        if (m0 < M && nb < N) Yo[(size_t)m0 * ldy + nb] = acc[nt][2];
+        if (m1 < M && nb < N) Yo[(size_t)m1 * ldy + nb] = acc[nt][3];
+    }
+}
+
+// Y[m * ldy + n] = sum over splits of P[s * ldp + m * N + n], in split order (deterministic).
+__global__ void __launch_bounds__(256) k_ink_sum_splits(const float* __restrict__ P, float* __restrict__ Y,
+                                                        int M, int N, int ldy, int splits, size_t ldp) {
+    const size_t i = (size_t)blockIdx.x * 256 + threadIdx.x;
+    if (i >= (size_t)M * N) return;
+    const int m = (int)(i / N), n = (int)(i % N);
+    float v = 0.0f;
+    for (int s = 0; s < splits; ++s) v += P[s * ldp + i];
+    Y[(size_t)m * ldy + n] = v;
+}
+
+// Small-M S_K linear on tensor cores. scratch must hold splits * M * N floats when it is used (N < 4096 rows).
+inline bool launch_sk_mma(int fmt, const uint8_t* W, const float* X, float* Y, int M, int N, int K, int ldy,
+                          float* scratch, size_t scratch_floats, cudaStream_t st) {
+    if (M < 1 || M > 16 || (K & 255) != 0) return false;
+    if (fmt != FMT_S5_K && fmt != FMT_S6_K && fmt != FMT_S8_K) return false;
+    const int warps = (N + 15) / 16;
+    int splits = 1;
+    // Keep ~1500 warps in flight: a few hundred rows (an o_proj or down_proj) cannot fill the GPU otherwise.
+    while (warps * splits < 1500 && splits * 2 <= (K >> 8) && scratch &&
+           (size_t)(splits * 2) * M * N <= scratch_floats) splits *= 2;
+    const dim3 grid((warps + 3) / 4, splits);
+    float* out = (splits > 1) ? scratch : Y;
+    const int ld = (splits > 1) ? N : ldy;
+    const size_t lds = (size_t)M * N;
+#define INK_SK_MMA(F)                                                                              \
+    if (M <= 8) k_ink_sk_mma<F, 1><<<grid, 128, 0, st>>>(W, X, out, M, N, K, ld, lds);           \
+    else        k_ink_sk_mma<F, 2><<<grid, 128, 0, st>>>(W, X, out, M, N, K, ld, lds);
+    if (fmt == FMT_S5_K)      { INK_SK_MMA(FMT_S5_K) }
+    else if (fmt == FMT_S6_K) { INK_SK_MMA(FMT_S6_K) }
+    else                      { INK_SK_MMA(FMT_S8_K) }
+#undef INK_SK_MMA
+    if (splits > 1) {
+        const size_t tot = (size_t)M * N;
+        k_ink_sum_splits<<<(unsigned)((tot + 255) / 256), 256, 0, st>>>(scratch, Y, M, N, ldy, splits, lds);
+    }
+    return true;
+}
+
 // ============================================================================
 // 7. Exact 2-Stage Cauchy-Schwarz Screened Unembed (0.25 ms on RTX 5090, 100.000% Bit-Exact Argmax!)
 //    Coarse plane: symmetric INT8 per-row quantized unembed [V, 2304] (460 MB) + per-row scale sc[V] + exact L2 error eps[V]!

@@ -1781,6 +1781,8 @@ struct InkCudaRunner {
     bool prof_enabled = false;
     // STRATA_INK_S6K_GEMV=0 keeps the BF16-expand + cuBLAS path for small-M S6_K matrices (A/B comparisons).
     const bool s6k_gemv_off_ = [] { const char* e = std::getenv("STRATA_INK_S6K_GEMV"); return e && e[0] == '0'; }();
+    // STRATA_INK_SK_MMA=0: small-M S5_K/S6_K/S8_K linears go back to the BF16 expansion (S5_K, S8_K) or GEMV (S6_K).
+    const bool sk_mma_on_ = [] { const char* e = std::getenv("STRATA_INK_SK_MMA"); return !(e && e[0] == '0'); }();
     double prof_ms[8] = {};  // 0=res/ctrl/norm, 1=dense_qkv, 2=sconv_clip_kv, 3=attn, 4=dense_wo, 5=moe, 6=other, 7=unembed
     cudaEvent_t ev_p0 = nullptr, ev_p1 = nullptr;
     void prof_mark_start() { if (prof_enabled) INK_CK(cudaEventRecord(ev_p0, st)); }
@@ -2806,6 +2808,11 @@ struct InkCudaRunner {
                 k_ink_q8row_to_bf16<<<dg, 256, 0, st>>>(W, w_dst, N, K);
                 gemm_bf16_compat(w_dst, X, Y, M, N, K, N, reuse_x_bf16, true);
             }
+        } else if ((ti.fmt == FMT_S5_K || ti.fmt == FMT_S6_K || ti.fmt == FMT_S8_K) && M <= 16 && (K % 256) == 0 &&
+                   cur_cc >= 80 && sk_mma_on_ && (M > 1 || ti.fmt != FMT_S6_K || s6k_gemv_off_) &&
+                   launch_sk_mma(ti.fmt, W, X, Y, M, N, K, N, reinterpret_cast<float*>(d_w_scratch),
+                                 d_w_scratch ? (size_t)kInkDsparkInter * kInkHidden / 2 : 0, st)) {
+            // Small M on tensor cores (DSpark drafter layers, verify heads): reads W once, coalesced (k_ink_sk_mma).
         } else if (ti.fmt == FMT_S6_K && M <= 16 && (K % 256) == 0 && !s6k_gemv_off_) {
             // Small M (decode, DSpark verify/draft heads): read the S6_K weights once instead of expanding them to BF16.
             const int grid = (N + 7) / 8;
@@ -3507,6 +3514,20 @@ struct InkCudaRunner {
                 graph_cache.push_back({key, exec});
             }
             INK_CK(cudaGraphLaunch(exec, st));
+            return;
+        }
+        // Experiment: STRATA_INK_PROF=1 also times the stages of verify batches (averaged over 32 batches).
+        static const bool prof_v = std::getenv("STRATA_INK_PROF") != nullptr;
+        if (prof_v) {
+            static int nv = 0, mv = 0;
+            if (nv == 0) prof_reset();
+            prof_enabled = true;
+            prof_mark_start();
+            emit_48_visits(M, 2, slot0, p0, want_taps);
+            prof_mark_end(6);
+            prof_enabled = false;
+            mv += M;
+            if (++nv == 32) { char tag[48]; std::snprintf(tag, sizeof(tag), "VERIFY avgM=%.1f", mv / 32.0); prof_print(tag, 32); std::fflush(stdout); nv = 0; mv = 0; }
             return;
         }
         emit_48_visits(M, 2, slot0, p0, want_taps);
