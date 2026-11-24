@@ -2809,10 +2809,11 @@ struct InkCudaRunner {
                 gemm_bf16_compat(w_dst, X, Y, M, N, K, N, reuse_x_bf16, true);
             }
         } else if ((ti.fmt == FMT_S5_K || ti.fmt == FMT_S6_K || ti.fmt == FMT_S8_K) && M <= 16 && (K % 256) == 0 &&
-                   cur_cc >= 80 && sk_mma_on_ && (M > 1 || ti.fmt != FMT_S6_K || s6k_gemv_off_) &&
+                   cur_cc >= 80 && sk_mma_on_ &&
                    launch_sk_mma(ti.fmt, W, X, Y, M, N, K, N, reinterpret_cast<float*>(d_w_scratch),
                                  d_w_scratch ? (size_t)kInkDsparkInter * kInkHidden / 2 : 0, st)) {
-            // Small M on tensor cores (DSpark drafter layers, verify heads): reads W once, coalesced (k_ink_sk_mma).
+            // Small M on tensor cores (decode and verify heads, DSpark drafter layers): reads W once, coalesced
+            // (k_ink_sk_mma). A row's result does not depend on M, so verify heads match single-token heads bit for bit.
         } else if (ti.fmt == FMT_S6_K && M <= 16 && (K % 256) == 0 && !s6k_gemv_off_) {
             // Small M (decode, DSpark verify/draft heads): read the S6_K weights once instead of expanding them to BF16.
             const int grid = (N + 7) / 8;

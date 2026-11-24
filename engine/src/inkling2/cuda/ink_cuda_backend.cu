@@ -182,9 +182,16 @@ public:
                                   + (size_t)8 * max_slots_ * init_glob * per_visit_pos;
         // Include O(1) prefill ws (~114 MiB) + DSpark (~224 MiB when enabled) + activation ws (WDDM floor added inside loader!)
         const bool dspark_on = opts.enable_dspark && mf.m.dspark.present;
-        // Experiment (STRATA_INK_SCREEN=0): no int8 unembed screen (461 MB on SQ-10). The drafter then scores its
-        // candidates on the S6_K unembed itself, and the greedy tree head computes full logits.
-        const bool build_screen = dspark_on && !(std::getenv("STRATA_INK_SCREEN") && std::getenv("STRATA_INK_SCREEN")[0] == '0');
+        // The int8 unembed screen (461 MB on SQ-10) is built only where the small-M tensor-core linear cannot replace it
+        // (before sm_80, or STRATA_INK_SK_MMA=0); STRATA_INK_SCREEN=1/0 forces it. Without it the drafter scores its
+        // candidates on the S6_K unembed itself and the greedy tree head computes full logits, with the same kernel
+        // as single-token decoding, so greedy drafting stays bit-identical to plain greedy decoding.
+        // Measured (RTX 4060, SQ-10, 9.4k-token prompt, DSpark loaded): free VRAM 2.00 -> 2.43 GiB, KV in VRAM
+        // 6912 -> 14592 tokens, prefill 704 -> 895 tok/s, plain decode 33 -> 40 tok/s; drafts 3.3 -> 3.0 ms.
+        const char* scr_env = std::getenv("STRATA_INK_SCREEN");
+        const char* mma_env = std::getenv("STRATA_INK_SK_MMA");
+        const bool mma_head = prop.major >= 8 && !(mma_env && mma_env[0] == '0');
+        const bool build_screen = dspark_on && (scr_env ? scr_env[0] != '0' : !mma_head);
         const size_t dspark_pad = dspark_on ? (224ull << 20) : 0ull;
         const size_t ws_pad = ((max_slots_ >= 8) ? (1280ull << 20)
                              : ((prop.totalGlobalMem >= (20ull << 30)) ? (960ull << 20)
