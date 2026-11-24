@@ -196,7 +196,7 @@ public:
         if (!model_.load_from_model_file(mf, gpu_id_, peer_gpu_id, (float)opts.ep_split, build_screen, err,
                                          min_reserve_bytes, gguf_detail::gguf_dequant_row_f32, gguf_detail::gguf_row_bytes,
                                          opts.vram_experts_gb, opts.ram_experts_gb, opts.ssd_experts,
-                                         all_gpus, opts.layer_split, opts.threads)) {
+                                         all_gpus, opts.layer_split, opts.cpu_threads > 0 ? opts.cpu_threads : opts.threads)) {
             return false;
         }
 

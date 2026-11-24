@@ -1220,7 +1220,7 @@ struct InkHybridEngine {
     static constexpr int kSplitXG = kInkHidden / 64;  // 36 activation groups per token for gate/up
     static constexpr int kSplitHG = kInkInter / 64;   // 18 for down
     bool split_on = true;                             // STRATA_INK_HOST_SPLIT=0: one expert per thread, as before
-    int split_rows = 128;                             // STRATA_INK_SPLIT_ROWS: rows per task
+    int split_rows = 64;                              // STRATA_INK_SPLIT_ROWS: rows per task (PC-101 decode: 64 beat 128 by ~9%)
     std::vector<SplitGroup> sp_groups;
     std::vector<SplitTask> sp_tasks;
     std::vector<host_avx2::SkActG64> sp_xtok, sp_xa, sp_ha;

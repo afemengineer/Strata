@@ -3392,6 +3392,7 @@ struct InkCudaRunner {
     // ---- Launch Full 48-Visit Forward (with Safe CUDA Graph Capture -> Eager Fallback, NEVER exit(3)!) ----
     void forward_seq(const int32_t* tok_ids, int p0, int M, int slot0, bool want_taps) {
         if (m.ls_active && cur_stage != 0) bind_stage(0);
+        if (M == 1 && std::getenv("STRATA_INK_PROF")) use_cuda_graph = false;  // experiment: profile single tokens
         int32_t* slot_buf = h_meta_pin + (meta_ring_idx++ & 63ull) * meta_ring_stride;
         std::memcpy(slot_buf, tok_ids, (size_t)M * 4);
         int32_t* h_pos = slot_buf + M;
@@ -3431,6 +3432,20 @@ struct InkCudaRunner {
         }
         // Experiment: STRATA_INK_PROF=1 times each stage of prompt batches (syncs after every stage, so slower).
         static const bool prof_env = std::getenv("STRATA_INK_PROF") != nullptr;
+        if (prof_env && M == 1) {
+            // Single tokens: averaged over 64 tokens (CUDA graphs are off while profiling).
+            static int n1 = 0;
+            use_cuda_graph = false;
+            if (n1 == 0) prof_reset();
+            prof_enabled = true;
+            prof_mark_start();
+            emit_48_visits(M, 0, slot0, p0, want_taps);
+            prof_mark_end(6);
+            prof_enabled = false;
+            if (++n1 == 64) { prof_print("DECODE M=1", 64); std::fflush(stdout); n1 = 0; }
+            if (m.hybrid.active && m.n_host_experts > 0) m.hybrid.step_promote(m.d_sec4, m.d_experts, st);
+            return;
+        }
         if (prof_env && M > 16) { prof_enabled = true; prof_reset(); prof_mark_start(); }
         emit_48_visits(M, 0, slot0, p0, want_taps);
         if (prof_env && M > 16) {
