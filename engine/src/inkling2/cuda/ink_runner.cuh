@@ -1785,6 +1785,7 @@ struct InkCudaRunner {
     // STRATA_INK_S6K_GEMV=0 keeps the BF16-expand + cuBLAS path for small-M S6_K matrices (A/B comparisons).
     const bool s6k_gemv_off_ = [] { const char* e = std::getenv("STRATA_INK_S6K_GEMV"); return e && e[0] == '0'; }();
     // STRATA_INK_SK_MMA=0: small-M S5_K/S6_K/S8_K linears go back to the BF16 expansion (S5_K, S8_K) or GEMV (S6_K).
+    const bool pf_tile_once_ = [] { const char* e = std::getenv("STRATA_INK_PF_TILE_ONCE"); return !(e && e[0] == '0'); }();
     const bool sk_mma_on_ = [] { const char* e = std::getenv("STRATA_INK_SK_MMA"); return !(e && e[0] == '0'); }();
     double prof_ms[8] = {};  // 0=res/ctrl/norm, 1=dense_qkv, 2=sconv_clip_kv, 3=attn, 4=dense_wo, 5=moe, 6=other, 7=unembed
     cudaEvent_t ev_p0 = nullptr, ev_p1 = nullptr;
@@ -2865,8 +2866,11 @@ struct InkCudaRunner {
         const size_t s_b  = (size_t)kInkHeads * Q_CH * kInkPfKvTile * sizeof(float);
         const size_t p_b  = (size_t)kInkHeads * Q_CH * kInkPfKvTile * sizeof(__nv_bfloat16);
         const size_t o_b  = (size_t)kInkHeads * Q_CH * kInkHeadDim * sizeof(float);
-        const size_t ml_b = (size_t)kInkHeads * Q_CH * sizeof(float);
-        const size_t need = q_b + 2 * kv_b + s_b + p_b + 2 * o_b + 2 * ml_b;
+        // The running softmax state of every sub-chunk of a chunk (the global-layer loop reads each KV tile once).
+        const size_t n_sub = (size_t)(std::max(Q_CH, max_batch) + Q_CH - 1) / Q_CH;
+        const size_t oa_b = n_sub * o_b;
+        const size_t ml_b = n_sub * (size_t)kInkHeads * Q_CH * sizeof(float);
+        const size_t need = q_b + 2 * kv_b + s_b + p_b + oa_b + o_b + 2 * ml_b;
         size_t vf = 0, vt = 0;
         const int dev = m.ls_active ? m.stage_gpu[cur_stage] : m.primary_gpu;
         if (ink_cuda_mem_info(&vf, &vt, dev) != cudaSuccess || vf < need + (192ull << 20)) return false;
@@ -2875,7 +2879,7 @@ struct InkCudaRunner {
             cudaMalloc(&d_pf_v, kv_b) != cudaSuccess ||
             cudaMalloc(&d_pf_s, s_b) != cudaSuccess ||
             cudaMalloc(&d_pf_p, p_b) != cudaSuccess ||
-            cudaMalloc(&d_pf_o, o_b) != cudaSuccess ||
+            cudaMalloc(&d_pf_o, oa_b) != cudaSuccess ||
             cudaMalloc(&d_pf_ot, o_b) != cudaSuccess ||
             cudaMalloc(&d_pf_m, ml_b) != cudaSuccess ||
             cudaMalloc(&d_pf_l, ml_b) != cudaSuccess) {
@@ -3128,6 +3132,57 @@ struct InkCudaRunner {
                 } else {
                     // Long-context KV-Tiled Online-Softmax TC Attention (K_len > 2048 -> O(1) 114 MiB VRAM forever!)
                     float* d_alpha_tmp = d_ctrl_gain;  // [max_batch * 2304] >> 24 * 256 floats!
+                    // Global layers: each KV tile is packed once and used by every 256-query sub-chunk (each keeps its
+                    // own running softmax). The sub-chunk-outer order packed every tile once per sub-chunk, and on
+                    // 8 GB cards most of a long context's KV is read from host RAM over PCIe: a 1024-token chunk
+                    // at 100k read ~10 GB instead of ~2.5. Same tiles, same arithmetic per sub-chunk.
+                    if (!is_swa && pf_tile_once_) {
+                        const size_t st_ml = (size_t)kInkHeads * Q_CH, st_o = st_ml * kInkHeadDim;
+                        for (int q0 = 0; q0 < M; q0 += Q_CH) {
+                            const int C = std::min(Q_CH, M - q0), qi = q0 / Q_CH;
+                            k_ink_pf_online_init<<<dim3(kInkHeads, C), 128, 0, st>>>(
+                                d_sinks, d_pf_m + qi * st_ml, d_pf_l + qi * st_ml, d_pf_o + qi * st_o, q0, C);
+                        }
+                        const int k_all_end = p0_val + M;
+                        for (int kt = k_start; kt < k_all_end; kt += kInkPfKvTile) {
+                            const int K_t = std::min(kInkPfKvTile, k_all_end - kt);
+                            if (use_fp16_pf) k_ink_pf_pack_kv<true><<<dim3(kInkKVHeads, K_t), 128, 0, st>>>(kv_desc[visit], slot0, kt, K_t, d_pf_k, d_pf_v);
+                            else             k_ink_pf_pack_kv<false><<<dim3(kInkKVHeads, K_t), 128, 0, st>>>(kv_desc[visit], slot0, kt, K_t, d_pf_k, d_pf_v);
+                            for (int q0 = 0; q0 < M; q0 += Q_CH) {
+                                const int C = std::min(Q_CH, M - q0), qi = q0 / Q_CH;
+                                const int k_sub_end = p0_val + q0 + C;
+                                if (kt >= k_sub_end) continue;
+                                const int K_q = std::min(K_t, k_sub_end - kt);
+                                const bool is_last = (kt + K_q >= k_sub_end);
+                                float* pm = d_pf_m + qi * st_ml;
+                                float* pl = d_pf_l + qi * st_ml;
+                                float* po = d_pf_o + qi * st_o;
+                                INK_CUBLAS_CK(cublasGemmStridedBatchedEx(
+                                    cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                                    K_q, C, kInkHeadDim, &sc_qk,
+                                    d_pf_k, pf_dt, kInkHeadDim, (long long)K_t * kInkHeadDim,
+                                    d_pf_q + (size_t)q0 * kInkHeadDim, pf_dt, kInkHeadDim, (long long)M * kInkHeadDim,
+                                    &zero, d_pf_s, CUDA_R_32F, K_q, (long long)C * K_q,
+                                    kInkHeads, CUBLAS_COMPUTE_32F, pf_algo));
+                                if (use_fp16_pf) {
+                                    k_ink_pf_softmax_tile_online<true><<<dim3(C, kInkHeads), 256, 0, st>>>(
+                                        d_pf_s, d_rel_table, d_pf_p, pm, pl, d_alpha_tmp, q0, C, kt, K_q, p0_val, false);
+                                } else {
+                                    k_ink_pf_softmax_tile_online<false><<<dim3(C, kInkHeads), 256, 0, st>>>(
+                                        d_pf_s, d_rel_table, d_pf_p, pm, pl, d_alpha_tmp, q0, C, kt, K_q, p0_val, false);
+                                }
+                                INK_CUBLAS_CK(cublasGemmStridedBatchedEx(
+                                    cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                                    kInkHeadDim, C, K_q, &one,
+                                    d_pf_v, pf_dt, kInkHeadDim, (long long)K_t * kInkHeadDim,
+                                    d_pf_p, pf_dt, K_q, (long long)C * K_q,
+                                    &zero, d_pf_ot, CUDA_R_32F, kInkHeadDim, (long long)C * kInkHeadDim,
+                                    kInkHeads, CUBLAS_COMPUTE_32F, pf_algo));
+                                k_ink_pf_accum_tile<<<dim3(kInkHeads, C), 128, 0, st>>>(
+                                    d_pf_ot, d_alpha_tmp, pl, po, d_gate_attn, d_attn_out, q0, C, is_last);
+                            }
+                        }
+                    } else
                     for (int q0 = 0; q0 < M; q0 += Q_CH) {
                         const int C = std::min(Q_CH, M - q0);
                         const int k_sub_beg = is_swa ? std::max(k_start, p0_val + q0 - kInkSwaWin + 1) : k_start;
