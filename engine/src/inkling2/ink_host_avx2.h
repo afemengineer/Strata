@@ -43,4 +43,13 @@ bool sk_rows_supported(int fmt) noexcept;
 void sk_rows_dot(const uint8_t* rows, size_t row_stride, int n_rows, int fmt, int n_groups,
                  const SkActG64* act, int act_groups, int T, float* out, size_t out_stride) noexcept;
 
+
+// Global attention over a run of FP16 KV tokens kept in host RAM, for one query token: the CPU part of a decode step
+// whose context no longer fits in VRAM (the GPU attends the VRAM part and merges both partial softmaxes).
+// q: [24][128] queries; rel: [24][1025] relative bias by distance (min(dist, 1024)); k, v: [n][8][128] FP16 tokens
+// whose first token is dist0 positions before the query. Writes, per query head, the partial softmax of these tokens:
+// running max m[24], sum l[24] and unnormalised output o[24][128]. 24 query heads share 8 KV heads (3:1).
+void attn_f16_partial(const float* q, const float* rel, const uint16_t* k, const uint16_t* v, int n, int dist0,
+                      float* m, float* l, float* o) noexcept;
+
 }  // namespace strata::ink::host_avx2

@@ -473,6 +473,61 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa(
 // ============================================================================
 // Adaptive Split-K FlashDecoding with 3-Head GQA KV Sharing (up to 32 splits -> 256 CTAs on M=1 -> saturates sm_75..sm_120!)
 // ============================================================================
+// ---- CPU attention over the host-RAM part of the global KV (M=1 decode, FP16 KV) ----
+// Measured (RTX 4060, SQ-10, 2026-11-24): with 14.6k tokens of KV in VRAM and the rest in mapped host RAM, the GPU read
+// the host part over PCIe at every step (~10 GB/s): decode fell to 14.5 tok/s at 32k, 4.0 at 64k, 3.6 at 100k. The CPU
+// reads the same KV from its own RAM at ~60 GB/s. The GPU rings this bell with the query, attends the VRAM keys, and
+// merges the CPU's partial softmax (InkHybridEngine::run_attn_tail) as one more split.
+struct alignas(64) InkAttnBell {
+    volatile uint32_t ring;
+    uint32_t pad0[15];
+    volatile uint32_t ack;
+    uint32_t pad1[15];
+    int32_t visit, qp, slot, dev_cap, host_cap;
+    uint32_t pad2[11];
+    float q[kInkHeads * kInkHeadDim];
+    float rel[kInkHeads * (kInkRelExtent + 1)];
+    float m[kInkHeads];
+    float l[kInkHeads];
+    float o[kInkHeads * kInkHeadDim];
+};
+
+// After the query and the relative-bias table: hands the CPU the keys past dev_cap (cur_seq = 0 when there are none).
+__global__ void __launch_bounds__(256) k_ink_attn_bell_ring(
+    const float* __restrict__ q,          // [1, 24, 128]
+    const float* __restrict__ rel_table,  // [1, 24, 1025]
+    const int32_t* __restrict__ q_pos,    // [1]
+    int slot, int visit, int dev_cap, int host_cap,
+    InkAttnBell* bell, uint32_t* seq_dev, uint32_t* cur_seq) {
+    const int tid = threadIdx.x;
+    const int qp = q_pos[0];
+    if (qp < dev_cap) {
+        if (tid == 0) *cur_seq = 0u;
+        return;
+    }
+    for (int i = tid; i < kInkHeads * kInkHeadDim; i += 256) bell->q[i] = q[i];
+    // Only the distances the host keys use: 0..qp-dev_cap (clamped) and the far bucket.
+    const int nd = min(qp - dev_cap, kInkRelExtent);
+    for (int i = tid; i < kInkHeads * (kInkRelExtent + 1); i += 256) {
+        const int dd = i % (kInkRelExtent + 1);
+        if (dd <= nd || dd == kInkRelExtent) bell->rel[i] = rel_table[i];
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (tid == 0) {
+        bell->visit = visit;
+        bell->qp = qp;
+        bell->slot = slot;
+        bell->dev_cap = dev_cap;
+        bell->host_cap = host_cap;
+        __threadfence_system();
+        const uint32_t sq = ++(*seq_dev);
+        bell->ring = sq;
+        __threadfence_system();
+        *cur_seq = sq;
+    }
+}
+
 constexpr int kInkAttnSplits = 8;
 constexpr int kInkAttnMaxSplits = 32;
 
@@ -493,7 +548,8 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_splitk(
     float* __restrict__ part_l,           // [M, 24, n_splits]
     float* __restrict__ part_o,           // [M, 24, n_splits, 128]
     int M,
-    int n_splits = kInkAttnSplits) {
+    int n_splits = kInkAttnSplits,
+    int vram_only = 0) {                  // 1: keys in mapped host RAM are attended on the CPU (InkAttnBell)
     // Tokens vary fastest: the M blocks reading the same (head, split) KV range run together, so with the global KV
     // in mapped host RAM (8 GB cards) the tree verify reads it over PCIe about once instead of once per token.
     const int m  = blockIdx.x;  // 0..M-1
@@ -518,7 +574,7 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_splitk(
 
     const int tp0 = tree_k ? q_pos[0] : tree_p0;
     const int k_start = kv.is_swa ? max(0, qp - kInkSwaWin + 1) : 0;
-    const int k_end   = qp + 1;
+    const int k_end   = (vram_only && !kv.is_swa && kv.host_cap > 0) ? min(qp + 1, kv.dev_cap) : qp + 1;
     const int k_len   = max(0, k_end - k_start);
     const int per_sp  = (k_len + n_splits - 1) / n_splits;
     const int s_beg   = k_start + sp * per_sp;
@@ -610,19 +666,40 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_merge(
     const float* __restrict__ gate_attn,  // [M, 24, 128]
     float* __restrict__ out,              // [M, 24, 128]
     int M,
-    int n_splits = kInkAttnSplits) {
+    int n_splits = kInkAttnSplits,
+    const InkAttnBell* bell = nullptr,    // M == 1: the CPU's partial over the host-RAM keys, when cur_seq != 0
+    const uint32_t* __restrict__ cur_seq = nullptr) {
     const int h = blockIdx.x;
     const int m = blockIdx.y;
     const int d = threadIdx.x;  // 0..127
     if (h >= kInkHeads || m >= M) return;
 
+    float em = -1e30f, el = 0.0f, eo = 0.0f;
+    if (bell) {
+        const uint32_t sq = *cur_seq;
+        if (sq != 0u) {
+            if (d == 0) {
+                while (*(volatile const uint32_t*)&bell->ack != sq) {
+                }
+            }
+            __syncthreads();
+            em = __ldcv(&bell->m[h]);
+            el = __ldcv(&bell->l[h]);
+            eo = __ldcv(&bell->o[h * kInkHeadDim + d]);
+        }
+    }
     const size_t base_sp = ((size_t)m * kInkHeads + h) * n_splits;
-    float mg = -1e30f;
+    float mg = (el > 0.0f) ? em : -1e30f;
     for (int s = 0; s < n_splits; ++s) {
         if (part_l[base_sp + s] > 0.0f) mg = fmaxf(mg, part_m[base_sp + s]);
     }
     float lt = 0.0f;
     float acc = 0.0f;
+    if (el > 0.0f) {
+        const float w = __expf(em - mg);
+        lt = el * w;
+        acc = eo * w;
+    }
     for (int s = 0; s < n_splits; ++s) {
         const float ls = part_l[base_sp + s];
         if (ls > 0.0f) {

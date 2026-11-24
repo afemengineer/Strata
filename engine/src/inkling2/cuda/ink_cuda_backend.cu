@@ -248,6 +248,7 @@ public:
         if (!vf_graph_ok) {
             std::fprintf(stderr, "[inkling-cuda] sm_70 under volta-forever: disabling 1024-thread CUDA Graph capture by default\n");
         }
+        runner_->dspark_reserve = dspark_on;
         runner_->init(max_slots_, std::max(256, opts.max_ctx), std::max(64, opts.chunk), cuda_kvd, kv_offload_mode);
         eff_max_ctx_ = runner_->max_ctx;
 

@@ -933,6 +933,12 @@ if(STRATA_BUILD_TESTS AND TARGET strata_inkling_core)
   add_executable(ink_host_sk_test tests/core/ink_host_sk_test.cpp)
   target_link_libraries(ink_host_sk_test PRIVATE strata_inkling_core)
   add_test(NAME ink_host_sk_test COMMAND ink_host_sk_test)
+  # CPU attention over the global KV kept in host RAM (8 GB cards, long contexts) against FP64 (no GPU)
+  add_executable(ink_attn_cpu_test tests/core/ink_attn_cpu_test.cpp)
+  target_include_directories(ink_attn_cpu_test PRIVATE src/inkling2)
+  target_link_libraries(ink_attn_cpu_test PRIVATE strata_inkling_core)
+  add_test(NAME ink_attn_cpu_test COMMAND ink_attn_cpu_test)
+  set_tests_properties(ink_attn_cpu_test PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 # What this configure registered, so a missing capability is a stated skip (tools/check prints this line too).

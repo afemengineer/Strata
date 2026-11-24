@@ -1647,6 +1647,9 @@ struct InkCudaRunner {
 
     int max_slots = 1;
     int max_ctx = 4096;
+    // The VRAM held back for DSpark's workspace and its per-token KV, when the model has a drafter. Off when drafting
+    // is off: on an 8 GB card that space holds more of the global KV (see init).
+    bool dspark_reserve = true;
     int kv_alloc_ctx = 0;         // Elastic global KV current allocated capacity (dev_ctx + host_ctx <= max_ctx!)
     int kv_dev_ctx = 0;           // Global KV positions resident in VRAM
     int kv_host_ctx = 0;          // Global KV positions offloaded to mapped pinned host RAM
@@ -1971,12 +1974,12 @@ struct InkCudaRunner {
             const size_t sconv_bytes  = (size_t)(n_swa_g0 + n_glob_g0) * max_slots * 3 * kInkSconvCh * 4;
             const size_t wddm_fl = InkCudaModel::wddm_safety_floor(vtot);
             const size_t ws_reserve = ((max_slots >= 8) ? (1280ull << 20) : (768ull << 20))
-                                    + (m.man.has_dspark ? (256ull << 20) : 0ull)
+                                    + ((m.man.has_dspark && dspark_reserve) ? (256ull << 20) : 0ull)
                                     + (wddm_fl / 2);
             const size_t avail_glob = (vfree > swa_kv_bytes + sconv_bytes + ws_reserve)
                 ? (vfree - swa_kv_bytes - sconv_bytes - ws_reserve) : 0u;
             const size_t per_pos_glob = (size_t)std::max(1, n_glob_g0) * max_slots * per_visit_pos
-                                      + (m.man.has_dspark ? (size_t)4096u : 0u);
+                                      + ((m.man.has_dspark && dspark_reserve) ? (size_t)4096u : 0u);
             const int vram_fit_ctx = (n_glob_g0 > 0)
                 ? (int)std::min<size_t>((size_t)max_ctx, (avail_glob / std::max<size_t>(1, per_pos_glob)) & ~(size_t)63)
                 : max_ctx;
@@ -2080,6 +2083,14 @@ struct InkCudaRunner {
             INK_CK(cudaMemset(d_sconv_pool[v], 0, (size_t)max_slots * 3 * kInkSconvCh * sizeof(float)));
         }
         INK_CK(cudaSetDevice(m.primary_gpu));
+        // Single-token decode attends the host-RAM part of the global KV on the CPU pool (InkAttnBell).
+        {
+            const char* e = std::getenv("STRATA_INK_ATTN_CPU");
+            m.hybrid.attn_hk = host_kv_raw_k;
+            m.hybrid.attn_hv = host_kv_raw_v;
+            m.hybrid.attn_cpu = m.hybrid.active && m.hybrid.h_abell && !m.ls_active && kv_dtype == InkKvDtype::FP16 &&
+                                host_avx2::available() && !(e && e[0] == '0');
+        }
 
         const size_t MB = (size_t)max_batch;
         d_cur       = dalloc<float>(MB * kInkHidden);
@@ -3052,14 +3063,22 @@ struct InkCudaRunner {
             k_ink_rel_table<<<gr, 256, 0, st>>>(d_r, (const float*)m.trunk_ptr_stage(cur_stage, p + ".attn.rel_logits_proj.proj"), d_rel_table, M);
             if (M <= 16 || mode == 2) {
                 const int n_sp = (M == 1) ? (is_swa ? 16 : kInkAttnMaxSplits) : kInkAttnSplits;
+                const bool cpu_tail = mode == 0 && M == 1 && !is_swa && kv_desc[visit].host_cap > 0 && m.hybrid.attn_cpu &&
+                                      cur_stage == 0;
+                if (cpu_tail) {
+                    k_ink_attn_bell_ring<<<1, 256, 0, st>>>(d_q, d_rel_table, d_pos, slot0, visit, kv_desc[visit].dev_cap,
+                                                            kv_desc[visit].host_cap, m.hybrid.d_abell, m.hybrid.d_aseq,
+                                                            m.hybrid.d_acur_seq);
+                }
                 dim3 gsp(M, kInkKVHeads, n_sp);
                 k_ink_flash_gqa_splitk<<<gsp, 128, 0, st>>>(
                     d_q, d_rel_table, d_sinks,
                     kv_desc[visit], (mode == 1) ? d_slots : nullptr, slot0, d_pos,
                     (mode == 2) ? d_k : nullptr, (mode == 2) ? d_v : nullptr,
                     (mode == 2) ? d_tree_anc : nullptr, (mode == 2) ? d_tree_dep : nullptr,
-                    p0_val, d_attn_pm, d_attn_pl, d_attn_po, M, n_sp);
-                k_ink_flash_gqa_merge<<<gr, 128, 0, st>>>(d_attn_pm, d_attn_pl, d_attn_po, d_gate_attn, d_attn_out, M, n_sp);
+                    p0_val, d_attn_pm, d_attn_pl, d_attn_po, M, n_sp, cpu_tail ? 1 : 0);
+                k_ink_flash_gqa_merge<<<gr, 128, 0, st>>>(d_attn_pm, d_attn_pl, d_attn_po, d_gate_attn, d_attn_out, M, n_sp,
+                                                          cpu_tail ? m.hybrid.d_abell : nullptr, m.hybrid.d_acur_seq);
             } else if (mode == 0 && M >= 128 && (cur_cc >= 70 || cur_cc == 60) && ensure_pf_attn(kInkPfKvTile)) {
                 // O(1)-VRAM KV-Tiled Online-Softmax Tensor Core Prefill Attention (fixed <= ~114 MiB even at 256K+ ctx!)
                 const bool use_fp16_pf = (cur_cc < 80);

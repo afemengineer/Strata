@@ -326,9 +326,108 @@ void sk_rows_dot(const uint8_t* rows, size_t row_stride, int n_rows, int fmt, in
     else if (fmt == kFmtS3_K) sk_rows_dot_fmt<kFmtS3_K>(rows, row_stride, n_rows, n_groups, act, act_groups, T, out, out_stride);
 }
 
+namespace {
+
+// exp(x) for 8 lanes, |rel err| < 2e-7 on [-87, 88] (Cephes polynomial); x below -87 gives 0.
+inline __m256 exp8(__m256 x) noexcept {
+    const __m256 hi = _mm256_set1_ps(88.3762626647949f), lo = _mm256_set1_ps(-87.3365447505531f);
+    const __m256 under = _mm256_cmp_ps(x, lo, _CMP_LT_OQ);
+    x = _mm256_max_ps(_mm256_min_ps(x, hi), lo);
+    __m256 fx = _mm256_round_ps(_mm256_mul_ps(x, _mm256_set1_ps(1.44269504088896341f)), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    x = _mm256_fnmadd_ps(fx, _mm256_set1_ps(0.693359375f), x);
+    x = _mm256_fnmadd_ps(fx, _mm256_set1_ps(-2.12194440e-4f), x);
+    __m256 y = _mm256_set1_ps(1.9875691500E-4f);
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(1.3981999507E-3f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(8.3334519073E-3f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(4.1665795894E-2f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(1.6666665459E-1f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(5.0000001201E-1f));
+    y = _mm256_fmadd_ps(y, _mm256_mul_ps(x, x), _mm256_add_ps(x, _mm256_set1_ps(1.0f)));
+    const __m256i e = _mm256_slli_epi32(_mm256_add_epi32(_mm256_cvtps_epi32(fx), _mm256_set1_epi32(127)), 23);
+    return _mm256_andnot_ps(under, _mm256_mul_ps(y, _mm256_castsi256_ps(e)));
+}
+
+inline float hsum8(__m256 v) noexcept {
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_movehdup_ps(s));
+    return _mm_cvtss_f32(s);
+}
+
+inline float hmax8(__m256 v) noexcept {
+    __m128 s = _mm_max_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    s = _mm_max_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_max_ss(s, _mm_movehdup_ps(s));
+    return _mm_cvtss_f32(s);
+}
+
+inline __m256 ld_h8(const uint16_t* p) noexcept { return _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p))); }
+
+}  // namespace
+
+void attn_f16_partial(const float* q, const float* rel, const uint16_t* k, const uint16_t* v, int n, int dist0,
+                      float* m, float* l, float* o) noexcept {
+    constexpr int HD = 128, KVH = 8, B = 16;
+    constexpr float kScale = 0.08838834764831845f;  // 1 / sqrt(128), as on the GPU
+    for (int h = 0; h < 24; ++h) { m[h] = -1e30f; l[h] = 0.0f; }
+    std::memset(o, 0, sizeof(float) * 24 * HD);
+    alignas(32) float s[3][B];
+    for (int kh = 0; kh < KVH; ++kh) {
+        const float* q3 = q + (size_t)3 * kh * HD;
+        for (int j0 = 0; j0 < n; j0 += B) {
+            const int nb = (n - j0) < B ? (n - j0) : B;
+            for (int j = 0; j < nb; ++j) {
+                const uint16_t* kp = k + ((size_t)(j0 + j) * KVH + kh) * HD;
+                __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0;
+                for (int d = 0; d < HD; d += 8) {
+                    const __m256 kv = ld_h8(kp + d);
+                    a0 = _mm256_fmadd_ps(kv, _mm256_loadu_ps(q3 + d), a0);
+                    a1 = _mm256_fmadd_ps(kv, _mm256_loadu_ps(q3 + HD + d), a1);
+                    a2 = _mm256_fmadd_ps(kv, _mm256_loadu_ps(q3 + 2 * HD + d), a2);
+                }
+                int dist = dist0 - (j0 + j);
+                dist = dist < 0 ? 0 : (dist > 1024 ? 1024 : dist);
+                const size_t rb = (size_t)3 * kh * 1025 + dist;
+                s[0][j] = hsum8(a0) * kScale + rel[rb];
+                s[1][j] = hsum8(a1) * kScale + rel[rb + 1025];
+                s[2][j] = hsum8(a2) * kScale + rel[rb + 2 * 1025];
+            }
+            for (int j = nb; j < B; ++j) s[0][j] = s[1][j] = s[2][j] = -1e30f;
+            for (int r = 0; r < 3; ++r) {
+                const int h = 3 * kh + r;
+                const __m256 s0 = _mm256_load_ps(s[r]), s1 = _mm256_load_ps(s[r] + 8);
+                const float mb = hmax8(_mm256_max_ps(s0, s1));
+                const float mn = mb > m[h] ? mb : m[h];
+                const __m256 mnv = _mm256_set1_ps(mn);
+                const __m256 p0 = exp8(_mm256_sub_ps(s0, mnv)), p1 = exp8(_mm256_sub_ps(s1, mnv));
+                const __m256 al = exp8(_mm256_set1_ps(m[h] - mn));
+                const float alpha = _mm256_cvtss_f32(al);
+                alignas(32) float p[B];
+                _mm256_store_ps(p, p0);
+                _mm256_store_ps(p + 8, p1);
+                l[h] = l[h] * alpha + hsum8(_mm256_add_ps(p0, p1));
+                m[h] = mn;
+                float* oh = o + (size_t)h * HD;
+                __m256 acc[HD / 8];
+                for (int d = 0; d < HD / 8; ++d) acc[d] = _mm256_mul_ps(_mm256_loadu_ps(oh + 8 * d), al);
+                for (int j = 0; j < nb; ++j) {
+                    const uint16_t* vp = v + ((size_t)(j0 + j) * KVH + kh) * HD;
+                    const __m256 pj = _mm256_set1_ps(p[j]);
+                    for (int d = 0; d < HD / 8; ++d) acc[d] = _mm256_fmadd_ps(ld_h8(vp + 8 * d), pj, acc[d]);
+                }
+                for (int d = 0; d < HD / 8; ++d) _mm256_storeu_ps(oh + 8 * d, acc[d]);
+            }
+        }
+    }
+}
+
 #else
 
 bool sk_rows_supported(int) noexcept { return false; }
+void attn_f16_partial(const float*, const float*, const uint16_t*, const uint16_t*, int, int, float* m, float* l, float*) noexcept {
+    for (int h = 0; h < 24; ++h) { m[h] = -1e30f; l[h] = 0.0f; }
+}
+
 void sk_rows_dot(const uint8_t*, size_t, int, int, int, const SkActG64*, int, int, float*, size_t) noexcept {}
 
 float dot_sf4_row(const uint8_t*, const uint8_t*, float, const float*, int, const float*) noexcept { return 0.0f; }

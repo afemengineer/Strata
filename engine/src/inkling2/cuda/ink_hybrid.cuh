@@ -17,6 +17,7 @@
 
 #include "ink_cuda.cuh"
 #include "ink_moe_cuda.cuh"
+#include "ink_attn.cuh"
 #include "../ink_cold_store.hpp"
 #include "../ink_host_avx2.h"
 #include "strata/core/moe_wave_plan.hpp"
@@ -1044,6 +1045,21 @@ struct InkHybridEngine {
     uint32_t* d_seq = nullptr;
     uint32_t* d_cur_seq = nullptr;
 
+    // CPU attention over the global KV kept in mapped host RAM (M=1 decode, FP16 KV): see InkAttnBell. The runner
+    // points attn_hk/attn_hv at its per-visit host KV arrays (host addresses) and sets attn_cpu.
+    bool attn_cpu = false;                    // STRATA_INK_ATTN_CPU=0 keeps the GPU reading host KV over PCIe
+    InkAttnBell* h_abell = nullptr;
+    InkAttnBell* d_abell = nullptr;
+    uint32_t* d_aseq = nullptr;
+    uint32_t* d_acur_seq = nullptr;
+    void* const* attn_hk = nullptr;
+    void* const* attn_hv = nullptr;
+    std::vector<float> at_part;               // [chunks][24 m, 24 l, 24*128 o]
+    int at_n = 0, at_dist_last = 0;
+    const uint16_t* at_k = nullptr;
+    const uint16_t* at_v = nullptr;
+    double at_s = 0.0; uint64_t at_rings = 0, at_toks = 0;
+
     // Simultaneous PCIe + CPU miss-sharing buffers for M=2..16 DSpark Block-8 verify
     float* h_v_x    = nullptr;   // pinned [16 * kInkHidden]
     float* h_v_y    = nullptr;   // pinned [16 * kInkTopK * kInkHidden]
@@ -1281,6 +1297,12 @@ struct InkHybridEngine {
     void run_task(const SplitTask& tk) noexcept {
         constexpr int D = kInkHidden, I = kInkInter;
         if (tk.kind == 0) { eval_doorbell_job(tk.a); return; }
+        if (tk.kind == 4) {
+            float* pm = at_part.data() + (size_t)tk.a * kAtPart;
+            host_avx2::attn_f16_partial(h_abell->q, h_abell->rel, at_k + (size_t)tk.r0 * kInkKVDim, at_v + (size_t)tk.r0 * kInkKVDim,
+                                        tk.r1 - tk.r0, at_dist_last + (at_n - 1 - tk.r0), pm, pm + kInkHeads, pm + 2 * kInkHeads);
+            return;
+        }
         if (tk.kind == 1) { eval_verify_group(tk.a); return; }
         const SplitGroup& G = sp_groups[tk.a];
         const size_t gi = (size_t)tk.a;
@@ -1322,6 +1344,57 @@ struct InkHybridEngine {
                 for (int t = 0; t < G.T; ++t)
                     std::memcpy(G.ys[t] + 2 * tk.r0, yb + (size_t)t * D + 2 * tk.r0, (size_t)2 * n * sizeof(float));
             }
+        }
+    }
+
+    static constexpr int kAtPart = 2 * kInkHeads + kInkHeads * kInkHeadDim;
+
+    // The keys [dev_cap, qp] of the ringing global visit, in chunks over the pool; their partial softmaxes are
+    // combined into h_abell->m/l/o for k_ink_flash_gqa_merge.
+    void run_attn_tail() noexcept {
+        const auto t0 = std::chrono::steady_clock::now();
+        const InkAttnBell* b = h_abell;
+        const int visit = b->visit, qp = b->qp, dev_cap = b->dev_cap, host_cap = b->host_cap, slot = b->slot;
+        at_n = qp - dev_cap + 1;
+        at_dist_last = 0;  // the last key is the query's own position
+        const size_t base = ((size_t)slot * host_cap) * kInkKVDim;
+        at_k = static_cast<const uint16_t*>(attn_hk[visit]) + base;
+        at_v = static_cast<const uint16_t*>(attn_hv[visit]) + base;
+        int chunk = (at_n + 4 * n_threads - 1) / (4 * n_threads);
+        chunk = std::max(128, (chunk + 15) & ~15);
+        const int nch = (at_n + chunk - 1) / chunk;
+        if (at_part.size() < (size_t)nch * kAtPart) at_part.resize((size_t)nch * kAtPart);
+        sp_tasks.clear();
+        for (int c = 0; c < nch; ++c) sp_tasks.push_back({4, c, c * chunk, std::min(at_n, (c + 1) * chunk)});
+        run_tasks_parallel(nch);
+        for (int h = 0; h < kInkHeads; ++h) {
+            float mg = -1e30f;
+            for (int c = 0; c < nch; ++c) {
+                const float* pm = at_part.data() + (size_t)c * kAtPart;
+                if (pm[kInkHeads + h] > 0.0f) mg = std::max(mg, pm[h]);
+            }
+            float lt = 0.0f;
+            float acc[kInkHeadDim] = {};
+            for (int c = 0; c < nch; ++c) {
+                const float* pm = at_part.data() + (size_t)c * kAtPart;
+                const float lc = pm[kInkHeads + h];
+                if (lc <= 0.0f) continue;
+                const float w = std::exp(pm[h] - mg);
+                lt += lc * w;
+                const float* oc = pm + 2 * kInkHeads + (size_t)h * kInkHeadDim;
+                for (int d = 0; d < kInkHeadDim; ++d) acc[d] += oc[d] * w;
+            }
+            h_abell->m[h] = mg;
+            h_abell->l[h] = lt;
+            std::memcpy(h_abell->o + (size_t)h * kInkHeadDim, acc, sizeof(acc));
+        }
+        if (stats_every > 0) {
+            at_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            at_toks += (uint64_t)at_n;
+            if (++at_rings % (uint64_t)stats_every == 0)
+                std::fprintf(stderr, "[attn-cpu] rings=%llu keys/ring=%.0f cpu=%.3f ms/ring -> %.1f GB/s\n",
+                             (unsigned long long)at_rings, (double)at_toks / at_rings, 1e3 * at_s / at_rings,
+                             (double)at_toks * 2 * kInkKVDim * 2 / at_s / 1e9);
         }
     }
 
@@ -1513,6 +1586,13 @@ struct InkHybridEngine {
         INK_CK(cudaHostAlloc(&h_bell, sizeof(InkMappedDoorbell), cudaHostAllocMapped));
         std::memset(h_bell, 0, sizeof(InkMappedDoorbell));
         INK_CK(cudaHostGetDevicePointer(&d_bell, h_bell, 0));
+        INK_CK(cudaHostAlloc(&h_abell, sizeof(InkAttnBell), cudaHostAllocMapped));
+        std::memset(h_abell, 0, sizeof(InkAttnBell));
+        INK_CK(cudaHostGetDevicePointer(&d_abell, h_abell, 0));
+        d_aseq     = dalloc<uint32_t>(1);
+        d_acur_seq = dalloc<uint32_t>(1);
+        INK_CK(cudaMemset(d_aseq, 0, 4));
+        INK_CK(cudaMemset(d_acur_seq, 0, 4));
         d_seq     = dalloc<uint32_t>(1);
         d_cur_seq = dalloc<uint32_t>(1);
         INK_CK(cudaMemset(d_seq, 0, 4));
@@ -1608,9 +1688,19 @@ struct InkHybridEngine {
             });
         }
         master_thr = std::thread([this]() {
-            uint32_t seen = 0;
+            uint32_t seen = 0, aseen = 0;
             auto last_t = std::chrono::steady_clock::now();
             while (!stop_flag.load(std::memory_order_relaxed)) {
+                const uint32_t aseq = h_abell->ring;
+                if (aseq != aseen) {
+                    aseen = aseq;
+                    std::atomic_thread_fence(std::memory_order_acquire);
+                    run_attn_tail();
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    h_abell->ack = aseq;
+                    last_t = std::chrono::steady_clock::now();
+                    continue;
+                }
                 const uint32_t seq = h_bell->ring;
                 if (seq == seen) {
                     auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - last_t).count();
@@ -1869,6 +1959,7 @@ struct InkHybridEngine {
         if (h_copyback_buf) { cudaFreeHost(h_copyback_buf); h_copyback_buf = nullptr; h_copyback_bytes = 0; }
         cold_store.reset();
         if (h_bell) { cudaFreeHost(h_bell); h_bell = nullptr; d_bell = nullptr; }
+        if (h_abell) { cudaFreeHost(h_abell); h_abell = nullptr; d_abell = nullptr; }
         if (h_sec4_pinned) { cudaFreeHost(h_sec4_pinned); h_sec4_pinned = nullptr; h_sec4_bytes = 0; }
         if (h_sec4_pageable) {
 #ifdef _WIN32
