@@ -1779,6 +1779,8 @@ struct InkCudaRunner {
 
     // Optional per-stage profiler (active only when prof_enabled=true and graph disabled)
     bool prof_enabled = false;
+    // STRATA_INK_S6K_GEMV=0 keeps the BF16-expand + cuBLAS path for small-M S6_K matrices (A/B comparisons).
+    const bool s6k_gemv_off_ = [] { const char* e = std::getenv("STRATA_INK_S6K_GEMV"); return e && e[0] == '0'; }();
     double prof_ms[8] = {};  // 0=res/ctrl/norm, 1=dense_qkv, 2=sconv_clip_kv, 3=attn, 4=dense_wo, 5=moe, 6=other, 7=unembed
     cudaEvent_t ev_p0 = nullptr, ev_p1 = nullptr;
     void prof_mark_start() { if (prof_enabled) INK_CK(cudaEventRecord(ev_p0, st)); }
@@ -2804,6 +2806,13 @@ struct InkCudaRunner {
                 k_ink_q8row_to_bf16<<<dg, 256, 0, st>>>(W, w_dst, N, K);
                 gemm_bf16_compat(w_dst, X, Y, M, N, K, N, reuse_x_bf16, true);
             }
+        } else if (ti.fmt == FMT_S6_K && M <= 16 && (K % 256) == 0 && !s6k_gemv_off_) {
+            // Small M (decode, DSpark verify/draft heads): read the S6_K weights once instead of expanding them to BF16.
+            const int grid = (N + 7) / 8;
+            if (M == 1)      k_ink_gemv_s6k_multi<1><<<grid, 256, 0, st>>>(W, X, Y, M, N, K, N);
+            else if (M <= 4) k_ink_gemv_s6k_multi<4><<<grid, 256, 0, st>>>(W, X, Y, M, N, K, N);
+            else if (M <= 8) k_ink_gemv_s6k_multi<8><<<grid, 256, 0, st>>>(W, X, Y, M, N, K, N);
+            else             k_ink_gemv_s6k_multi<16><<<grid, 256, 0, st>>>(W, X, Y, M, N, K, N);
         } else {
             const size_t cap = (size_t)kInkDsparkInter * kInkHidden;
             const size_t max_tile = (cur_cc < 70) ? (cap / 3) : cap;
@@ -3129,6 +3138,10 @@ struct InkCudaRunner {
                     }
                 }
             } else {
+                if (M >= 128) {
+                    static bool warned = false;  // experiment: say when big batches take the untiled kernel
+                    if (!warned) { warned = true; std::fprintf(stderr, "[attn] M=%d uses k_ink_flash_gqa_gqa3 (no tiled prefill attention workspace)\n", M); }
+                }
                 dim3 g3(kInkKVHeads, M);
                 k_ink_flash_gqa_gqa3<<<g3, 128, 0, st>>>(
                     d_q, d_rel_table, d_sinks, d_gate_attn,
@@ -3416,7 +3429,18 @@ struct InkCudaRunner {
             if (m.hybrid.active && m.n_host_experts > 0) m.hybrid.step_promote(m.d_sec4, m.d_experts, st);
             return;
         }
+        // Experiment: STRATA_INK_PROF=1 times each stage of prompt batches (syncs after every stage, so slower).
+        static const bool prof_env = std::getenv("STRATA_INK_PROF") != nullptr;
+        if (prof_env && M > 16) { prof_enabled = true; prof_reset(); prof_mark_start(); }
         emit_48_visits(M, 0, slot0, p0, want_taps);
+        if (prof_env && M > 16) {
+            prof_mark_end(6);
+            char tag[32];
+            std::snprintf(tag, sizeof(tag), "PROMPT M=%d p0=%d", M, p0);
+            prof_print(tag, 1);
+            std::fflush(stdout);
+            prof_enabled = false;
+        }
         if (M == 1 && m.hybrid.active && m.n_host_experts > 0) m.hybrid.step_promote(m.d_sec4, m.d_experts, st);
     }
 

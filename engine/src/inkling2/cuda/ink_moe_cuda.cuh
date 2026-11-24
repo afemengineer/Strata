@@ -3252,8 +3252,13 @@ inline void launch_ink_moe_dispatch_only(
     const bool use_sm120_tc = (!force_exact_dec && M >= 24 && sm120::available());
     const bool use_fp16_tc  = (!use_sm120_tc && M >= 24 && ink_has_int8_tc());
     const bool use_wmma_tc  = (!use_sm120_tc && !use_fp16_tc && M >= 24 && ink_has_wmma_f16());
+    // Layers whose experts are all S*_K take 64-row tiles for big batches: each tile re-reads its expert, and with
+    // 16-row tiles a 1024-token batch read ~1.8 GB of expert weights per visit on an RTX 4060 (SQ-10, k_ink_moe_sk_tc).
+    // SF4/MX8 keep 16 rows: their FP16 tensor-core kernel only has that tile. STRATA_INK_SK_TILE64=0 restores 16.
+    static const bool sk_tile64 = [] { const char* e = std::getenv("STRATA_INK_SK_TILE64"); return !(e && e[0] == '0'); }();
+    const bool sk_only = info.has_sk && !info.has_sf4 && !info.has_mx8 && !info.has_gguf;
     const int tile_rows = use_wmma_tc ? ((M <= 128) ? 16 : 64)
-                                      : ((M <= 128 || use_fp16_tc) ? 16 : 64);
+                                      : ((M <= 128 || (use_fp16_tc && !(sk_only && sk_tile64))) ? 16 : 64);
     k_ink_moe_bin<<<1, 128, 0, st>>>(experts, ws.topk_idx, M, tile_rows, ws.tb);
 
     const int P = M * kInkTopK;

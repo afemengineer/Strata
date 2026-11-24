@@ -16,6 +16,7 @@
 #include "ink_batch.h"
 #include "ink_manifest.h"
 #include "ink_serve.h"
+#include "ink_spec_gate.h"
 #include "ink_vision.h"
 #include "strata/core/device_error_exit.hpp"
 #include "strata/core/volta_forever.hpp"
@@ -195,9 +196,11 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
     int total_gen = 0, n_spec_steps = 0, n_spec_tok = 0;
     if (use_dspark && P == 1) {
         int cur_pos = prompt_len;
+        SpecGate gate;  // the server's choice between drafting and plain steps (ink_spec_gate.h)
         while (total_gen < gen_len && cur_pos < eff_ctx) {
             const int rem = std::min(gen_len - total_gen, eff_ctx - cur_pos);
-            if (rem >= 2 && cur_pos + 12 < eff_ctx) {
+            if (rem >= 2 && cur_pos + 12 < eff_ctx && gate.want_spec()) {
+                const double t_s0 = now_s();
                 int32_t emitted[16]{};
                 int drafted = 0;
                 const int n_emit = backend->dspark_spec_step_greedy(
@@ -207,9 +210,11 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
                     next_tok[0] = emitted[n_emit - 1];
                     cur_pos += n_emit;
                     total_gen += n_emit; ++n_spec_steps; n_spec_tok += n_emit;
+                    gate.on_spec(now_s() - t_s0, n_emit);
                     continue;
                 }
             }
+            const double t_p0 = now_s();
             batch.clear();
             batch.capture_taps = true;
             batch.push(0, cur_pos++, next_tok[0], true);
@@ -221,7 +226,10 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
             for (int i = 1; i < V; ++i) if (logits[i] > logits[best]) best = i;
             next_tok[0] = best;
             ++total_gen;
+            gate.on_plain(now_s() - t_p0);
         }
+        fprintf(stderr, "[bench] spec-gate: %.1f tok/s drafting (%.2f tokens/step), %.1f tok/s plain, %d plain tokens\n",
+                gate.spec_rate(), gate.spec_tokens, gate.plain_rate(), gate.n_plain);
     } else {
         for (int step = 0; step < gen_len; ++step) {
             batch.clear();

@@ -207,6 +207,27 @@ int bench() {
         std::printf("  %-3s threads=%-2d %6.0f us/expert  %6.1f GB/s\n", use_new ? "new" : "old", threads,
                     1e6 * s / n, n * mb / 1024.0 / s);
     };
+    // Several tokens per expert (DSpark verify, prompt batches): weights read once, T dot products per group.
+    for (int T : {1, 4, 8, 16}) {
+        const auto xt = planar(make_act(rng, T * kGroups)), ht = planar(make_act(rng, T * 18));
+        const int threads = (int)std::thread::hardware_concurrency(), per = 32;
+        auto t0 = std::chrono::steady_clock::now();
+        std::vector<std::thread> pool;
+        for (int th = 0; th < threads; ++th)
+            pool.emplace_back([&, th]() {
+                std::vector<float> g((size_t)T * kI), u((size_t)T * kI), y((size_t)T * kD);
+                for (int i = 0; i < per; ++i) {
+                    const Expert& e = ex[(th * 7 + i) % n_exp];
+                    sk_rows_dot(e.gu.data(), 2 * 9 * 102, kI, kS3, kGroups, xt.data(), kGroups, T, g.data(), kI);
+                    sk_rows_dot(e.gu.data() + 9 * 102, 2 * 9 * 102, kI, kS3, kGroups, xt.data(), kGroups, T, u.data(), kI);
+                    sk_rows_dot(e.dn.data(), 9 * 70, kD / 2, kS2, kGroups, ht.data(), 18, T, y.data(), kD);
+                }
+            });
+        for (auto& p : pool) p.join();
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::printf("  T=%-2d threads=%d %6.1f us/expert (all threads)  %5.1f us per token-expert\n", T, threads,
+                    1e6 * s / (threads * per), 1e6 * s / (threads * per) / T);
+    }
     time_it(false, 1, 16);
     time_it(true, 1, 128);
     const int hw = (int)std::thread::hardware_concurrency();

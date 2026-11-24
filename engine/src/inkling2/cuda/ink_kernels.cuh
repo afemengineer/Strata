@@ -1741,6 +1741,56 @@ __global__ void __launch_bounds__(256) k_ink_sk_to_bf16(const uint8_t* __restric
     dst[(size_t)row * K + col] = __float2bfloat16_rn(v);
 }
 
+// Y[m, n] = dot(W_n, X[m]) for an S6_K matrix [N, K] and M <= MAXM rows of X, reading W once.
+// Measured on an RTX 4060 (SQ-10 unembed, 200058 x 2304): the sk_to_bf16 + cuBLAS path wrote and re-read the whole
+// matrix as BF16 (~2.2 GB of traffic) for every decode token and every DSpark verify. One warp per row; lane l owns
+// values 8l..8l+7 of each 256-value superblock (one 64-value group per 8 lanes). A row's summation order does not
+// depend on M, so the single-token and tree-verify heads give identical logits.
+template <int MAXM>
+__global__ void __launch_bounds__(256) k_ink_gemv_s6k_multi(const uint8_t* __restrict__ W, const float* __restrict__ X,
+                                                             float* __restrict__ Y, int M, int N, int K, int ldy) {
+    const int row = blockIdx.x * 8 + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (row >= N) return;
+    constexpr int SB = ink_sb_bytes(FMT_S6_K);
+    const int nsb = K >> 8;
+    const uint8_t* rptr = W + (size_t)row * nsb * SB;
+    float acc[MAXM];
+#pragma unroll
+    for (int m = 0; m < MAXM; ++m) acc[m] = 0.0f;
+    for (int s = 0; s < nsb; ++s) {
+        const uint8_t* blk = rptr + s * SB;
+        const float eff = f16_to_f32(ld16_u(blk)) * ((float)blk[2 + (lane >> 3)] * (1.0f / 255.0f));
+        const uint8_t* pl = blk + 6;
+        float w[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const uint32_t lo = (pl[4 * lane + (j >> 1)] >> ((j & 1) * 4)) & 0x0Fu;
+            const uint32_t hi = (pl[128 + 2 * lane + (j >> 2)] >> ((j & 3) * 2)) & 3u;
+            w[j] = ((float)(lo | (hi << 4)) - 31.5f) * eff;
+        }
+        const int col = s * 256 + 8 * lane;
+#pragma unroll
+        for (int m = 0; m < MAXM; ++m) {
+            if (m < M) {
+                const float4 x0 = *reinterpret_cast<const float4*>(X + (size_t)m * K + col);
+                const float4 x1 = *reinterpret_cast<const float4*>(X + (size_t)m * K + col + 4);
+                float a = acc[m];
+                a = fmaf(w[0], x0.x, a); a = fmaf(w[1], x0.y, a); a = fmaf(w[2], x0.z, a); a = fmaf(w[3], x0.w, a);
+                a = fmaf(w[4], x1.x, a); a = fmaf(w[5], x1.y, a); a = fmaf(w[6], x1.z, a); a = fmaf(w[7], x1.w, a);
+                acc[m] = a;
+            }
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < MAXM; ++m) {
+        if (m < M) {
+            const float v = warp_sum(acc[m]);
+            if (lane == 0) Y[(size_t)m * ldy + row] = v;
+        }
+    }
+}
+
 // ============================================================================
 // 7. Exact 2-Stage Cauchy-Schwarz Screened Unembed (0.25 ms on RTX 5090, 100.000% Bit-Exact Argmax!)
 //    Coarse plane: symmetric INT8 per-row quantized unembed [V, 2304] (460 MB) + per-row scale sc[V] + exact L2 error eps[V]!

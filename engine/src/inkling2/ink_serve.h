@@ -28,6 +28,7 @@
 #include "ink_batch.h"
 #include "ink_manifest.h"
 #include "ink_prompt_ckpt.h"
+#include "ink_spec_gate.h"
 #include "ink_vision.h"
 
 namespace ink2 {
@@ -446,6 +447,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
     const int P = std::max(1, std::min(kMaxParallelSlots, cfg.bopts.parallel));
     const int chunk_sz = std::max(1, cfg.bopts.chunk);
     const bool use_dspark = (cfg.draft_mode != "off") && mf.m.dspark.present && backend.dspark_ready();
+    SpecGate spec_gate;  // drafts only while drafting is measured faster than plain decoding (ink_spec_gate.h)
 
     // Probe Vision shard lazily (zero VRAM/RAM until first image request)
     bool images_ok = false;
@@ -763,10 +765,16 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         }
 
         // 2. Fast-path: Single-stream DSpark Adaptive Beam Tree (greedy) / Block-8 Rejection Sampling (temperature >= 0) (#6633)!
-        if (use_dspark && n_active == 1 && reqs[sole_slot].prefill_pos >= reqs[sole_slot].prompt_len &&
+        if (use_dspark && n_active == 1 && spec_gate.want_spec() && reqs[sole_slot].prefill_pos >= reqs[sole_slot].prompt_len &&
             reqs[sole_slot].generated + 2 <= reqs[sole_slot].max_new &&
             reqs[sole_slot].cur_pos + 8 < eff_max_ctx) {
             auto& rq = reqs[sole_slot];
+            const double t_spec0 = now_s();
+            auto spec_done = [&](int tokens) {
+                if (spec_gate.on_spec(now_s() - t_spec0, tokens))
+                    std::fprintf(stderr, "[spec-gate] drafting off for %d tokens: %.1f tok/s drafting (%.2f tokens/step) vs %.1f tok/s plain\n",
+                                 spec_gate.probe_every, spec_gate.spec_rate(), spec_gate.spec_tokens, spec_gate.plain_rate());
+            };
             // 2a. Zero-D2H fused greedy Beam Tree speculative step (when greedy, no penalties, and headroom >= 12)
             if (rq.s.greedy() && !rq.s.penalties() && rq.cur_pos + 12 < eff_max_ctx) {
                 int32_t emitted[16]{};
@@ -810,6 +818,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                         rq.cur_pos += kept;
                         if (fin) finish_req(rq, fin);
                     }
+                    spec_done(n_emit);
                     continue;
                 }
             }
@@ -879,6 +888,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                 } else if (fin) {
                     finish_req(rq, fin);
                 }
+                spec_done(accepted);
                 continue;
             }
         }
@@ -945,6 +955,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
             return 1;
         }
         const double step_ms = (now_s() - t_step0) * 1000.0;
+        if (use_dspark && n_active == 1 && batch.token_ids.size() == 1) spec_gate.on_plain(step_ms / 1000.0);
 
         // Update prefill progress & emit PP lines (+ save the prompt checkpoint at ckpt_pos for #6627!)
         for (int s = 0; s < P; ++s) {

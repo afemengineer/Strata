@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -1053,6 +1054,10 @@ struct InkHybridEngine {
     double dec_pcie_share = -1.0; // -1 = auto, 0 = 100% CPU, 1 = 100% PCIe DMA (STRATA_INK_DEC_PCIE_SHARE)
     uint32_t promo_step = 0;      // cadence counter so step_promote does NOT sync every single token!
     int stats_every = 0;          // experiment: STRATA_INK_HYB_STATS
+    bool pf_cpu_on = true;        // STRATA_INK_PF_CPU=0: prompt batches copy every off-GPU expert, as before
+    double pcie_gbps = 13.0;      // STRATA_INK_PCIE_GBPS: host-to-GPU copy rate the prompt split assumes
+    double cpu_us_per_tok = 12.0; // learned CPU cost per routed token (PC-101: 12.3 us at 16 tokens/expert)
+    int v_cap = 16;               // tokens the h_v_* / d_v_* buffers hold
     uint64_t st_rings = 0, st_jobs = 0;
     double st_cpu_s = 0.0;
     long vs_n = 0, vs_host_n = 0, vs_cpu_n = 0;
@@ -1149,7 +1154,7 @@ struct InkHybridEngine {
     int cur_cold_slot[kInkTopK] = {-1,-1,-1,-1,-1,-1,-1,-1};
     const uint8_t* cur_cold_ptr[kInkTopK] = {};
     float cur_x[kInkHidden] = {};
-    CpuVerifyGroup verify_groups[kInkExperts];
+    std::vector<CpuVerifyGroup> verify_groups = std::vector<CpuVerifyGroup>(kInkExperts);
     std::vector<std::thread> workers;
     std::thread master_thr;
     int n_threads = 0;
@@ -1220,9 +1225,28 @@ struct InkHybridEngine {
     std::vector<SplitTask> sp_tasks;
     std::vector<host_avx2::SkActG64> sp_xtok, sp_xa, sp_ha;
     std::vector<float> sp_gu, sp_act, sp_y;
-    std::atomic<int> sp_left[kInkExperts];
+    std::unique_ptr<std::atomic<int>[]> sp_left;
+    size_t sp_left_cap = 0;
+    std::vector<uint8_t> sp_tok_done;
     std::atomic<int> task_next{0};
     int n_tasks = 0;
+
+    // Grows the pinned/device buffers that carry CPU-evaluated pairs to M tokens (M * 8 pairs).
+    bool ensure_v_cap(int M) {
+        if (M <= v_cap) return true;
+        INK_CK(cudaDeviceSynchronize());
+        auto fh = [](auto*& p) { if (p) { cudaFreeHost(p); p = nullptr; } };
+        auto fd = [](auto*& p) { if (p) { cudaFree(p); p = nullptr; } };
+        fh(h_v_x); fh(h_v_y); fh(h_v_p); fh(h_v_idx); fd(d_v_y); fd(d_v_p);
+        h_v_x   = halloc_pinned<float>((size_t)M * kInkHidden);
+        h_v_y   = halloc_pinned<float>((size_t)M * kInkTopK * kInkHidden);
+        h_v_p   = halloc_pinned<int32_t>((size_t)M * kInkTopK);
+        h_v_idx = halloc_pinned<int32_t>((size_t)M * kInkTopK);
+        d_v_y   = dalloc<float>((size_t)M * kInkTopK * kInkHidden);
+        d_v_p   = dalloc<int32_t>((size_t)M * kInkTopK);
+        v_cap = M;
+        return true;
+    }
 
     bool split_ok(const InkHostExpertMeta& hm) const noexcept {
         return split_on && hm.body != nullptr && host_avx2::sk_rows_supported(hm.gu_code) &&
@@ -1237,7 +1261,8 @@ struct InkHybridEngine {
         if (sp_gu.size() < g * 32 * kInkInter) sp_gu.resize(g * 32 * kInkInter);
         if (sp_act.size() < g * 16 * kInkInter) sp_act.resize(g * 16 * kInkInter);
         if (sp_y.size() < g * 16 * kInkHidden) sp_y.resize(g * 16 * kInkHidden);
-        if (sp_xtok.size() < 16 * kSplitXG) sp_xtok.resize(16 * kSplitXG);
+        if (sp_xtok.size() < (size_t)v_cap * kSplitXG) sp_xtok.resize((size_t)v_cap * kSplitXG);
+        if (sp_left_cap < g) { sp_left.reset(new std::atomic<int>[g]); sp_left_cap = g; }
     }
 
     static void quant_planar(const float* x, int n, host_avx2::SkActG64* out) noexcept {
@@ -1361,7 +1386,7 @@ struct InkHybridEngine {
     void run_verify_split(int ng) noexcept {
         split_reserve(ng);
         // Each verify token's activations are quantized once, then copied into every group that uses it.
-        bool tok_done[16] = {};
+        sp_tok_done.assign((size_t)v_cap, 0);
         sp_tasks.clear();
         int ns = 0;
         for (int gi = 0; gi < ng; ++gi) {
@@ -1379,9 +1404,9 @@ struct InkHybridEngine {
                 const int os = grp.out_slots[k];
                 h_v_p[os] = pid;
                 G.ys[k] = h_v_y + (size_t)os * kInkHidden;
-                if (m < 16 && !tok_done[m]) {
+                if (m < v_cap && !sp_tok_done[m]) {
                     quant_planar(h_v_x + (size_t)m * kInkHidden, kInkHidden, sp_xtok.data() + (size_t)m * kSplitXG);
-                    tok_done[m] = true;
+                    sp_tok_done[m] = 1;
                 }
                 std::memcpy(xa + (size_t)k * kSplitXG, sp_xtok.data() + (size_t)m * kSplitXG, kSplitXG * sizeof(host_avx2::SkActG64));
             }
@@ -1452,6 +1477,8 @@ struct InkHybridEngine {
         if (const char* e = std::getenv("STRATA_INK_DEC_PCIE_SHARE")) dec_pcie_share = std::max(0.0, std::min(1.0, std::atof(e)));
         if (const char* e = std::getenv("STRATA_INK_HYB_STATS")) stats_every = std::atoi(e);
         if (const char* e = std::getenv("STRATA_INK_HOST_SPLIT")) split_on = (e[0] != '0');
+        if (const char* e = std::getenv("STRATA_INK_PF_CPU")) pf_cpu_on = (e[0] != '0');
+        if (const char* e = std::getenv("STRATA_INK_PCIE_GBPS")) pcie_gbps = std::max(1.0, std::atof(e));
         if (const char* e = std::getenv("STRATA_INK_SPLIT_ROWS")) split_rows = std::max(16, std::atoi(e));
         INK_CK(cudaHostAlloc(&h_bell, sizeof(InkMappedDoorbell), cudaHostAllocMapped));
         std::memset(h_bell, 0, sizeof(InkMappedDoorbell));
@@ -1958,6 +1985,52 @@ inline void launch_ink_moe_hybrid(
                     INK_CK(cudaStreamSynchronize(st));
                 }
             }
+        } else if (!hyb.ssd_only && hyb.pf_cpu_on && hyb.active && hyb.ensure_v_cap(M)) {
+            // Prompt batches (M > 16). PC-101 (RTX 4060 8 GB, Core Ultra 7 265F, SQ-10): streaming every off-GPU expert
+            // took ~0.85 s per 512-token batch (~94% of prompt time) while the CPU idled. Copying an expert costs about
+            // the same whatever its token count; the CPU costs ~12 us per routed token. So the experts with the fewest
+            // tokens run on the CPU (in parallel with the copies) until both sides take about as long, and experts no
+            // token routes to are not copied at all.
+            int32_t* h_idx = hyb.h_v_idx;
+            INK_CK(cudaMemcpyAsync(h_idx, ws.topk_idx, (size_t)M * kInkTopK * 4, cudaMemcpyDeviceToHost, st));
+            { const auto a = std::chrono::steady_clock::now(); INK_CK(cudaStreamSynchronize(st)); vs_sync += std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count(); }
+            int ecnt[kInkExperts] = {};
+            for (int i = 0; i < M * kInkTopK; ++i) {
+                const int e = h_idx[i];
+                if (e >= 0 && e < kInkExperts) ++ecnt[e];
+            }
+            std::vector<int> off;
+            double xfer_us = 0.0;
+            for (int e = 0; e < kInkExperts; ++e) {
+                const int key = ip * kInkExperts + e;
+                if (ecnt[e] > 0 && hyb.host_meta[key].body != nullptr && (hyb.key_to_slot.empty() || hyb.key_to_slot[key] < 0)) {
+                    off.push_back(e);
+                    xfer_us += hyb.host_meta[key].body_bytes / (hyb.pcie_gbps * 1e3);
+                }
+            }
+            std::sort(off.begin(), off.end(), [&](int a, int b) { return ecnt[a] < ecnt[b]; });
+            uint8_t is_cpu[kInkExperts] = {};
+            double cpu_us = 0.0;
+            size_t n_cpu = 0;
+            for (; n_cpu < off.size(); ++n_cpu) {
+                const int e = off[n_cpu];
+                const double c = ecnt[e] * hyb.cpu_us_per_tok;
+                const double x = hyb.host_meta[ip * kInkExperts + e].body_bytes / (hyb.pcie_gbps * 1e3);
+                if (cpu_us + c > xfer_us - x) break;
+                cpu_us += c;
+                xfer_us -= x;
+                is_cpu[e] = 1;
+                cpu_eids.push_back(e);
+            }
+            host_list.assign(off.begin() + n_cpu, off.end());
+            for (int p = 0; p < M * kInkTopK; ++p) {
+                const int e = h_idx[p];
+                if (e >= 0 && e < kInkExperts && is_cpu[e]) cpu_pairs.push_back({p, e});
+            }
+            if (!cpu_pairs.empty()) {
+                INK_CK(cudaMemcpyAsync(hyb.h_v_x, x_f32, (size_t)M * kInkHidden * 4, cudaMemcpyDeviceToHost, st));
+                INK_CK(cudaStreamSynchronize(st));
+            }
         } else if (M <= 16 || hyb.ssd_only) {
             std::vector<int32_t> h_idx((size_t)M * kInkTopK);
             INK_CK(cudaMemcpyAsync(h_idx.data(), ws.topk_idx, (size_t)M * kInkTopK * 4, cudaMemcpyDeviceToHost, st));
@@ -2077,10 +2150,52 @@ inline void launch_ink_moe_hybrid(
             INK_CK(cudaMemcpyAsync(hyb.d_pf_exp_tmp[buf], h_exp, (size_t)kInkExperts * sizeof(InkExpertDev), cudaMemcpyHostToDevice, hyb.pf_dma_st));
             INK_CK(cudaEventRecord(hyb.pf_ev_dma[buf], hyb.pf_dma_st));
         };
+        // Group CPU-assigned pairs by expert, at most 16 tokens per group (one weight read per group).
+        const int np = (int)cpu_pairs.size();
+        int ng = 0;
+        if (np > 0) {
+            int eid_to_grp[kInkExperts];
+            std::memset(eid_to_grp, -1, sizeof(eid_to_grp));
+            if ((int)hyb.verify_groups.size() < np) hyb.verify_groups.resize(np);
+            for (int j = 0; j < np; ++j) {
+                const int pid = cpu_pairs[j].first;
+                const int e   = cpu_pairs[j].second;
+                int gi = eid_to_grp[e];
+                if (gi < 0 || hyb.verify_groups[gi].count == 16) {
+                    gi = ng++;
+                    eid_to_grp[e] = gi;
+                    hyb.verify_groups[gi].eid = e;
+                    hyb.verify_groups[gi].count = 0;
+                }
+                auto& grp = hyb.verify_groups[gi];
+                const int k = grp.count++;
+                grp.pids[k] = pid;
+                grp.out_slots[k] = j;
+            }
+        }
+        // Prompt batches run the CPU share on its own thread so it overlaps the copies below; the small verify
+        // batches keep running it after the GPU work is queued, as before.
+        const bool cpu_async = (M > 16 && ng > 0);
+        double cpu_thr_s = 0.0;
+        std::thread cpu_thr;
+        if (cpu_async) {
+            cpu_thr = std::thread([&hyb, ip, ng, &cpu_thr_s]() {
+                const auto a = std::chrono::steady_clock::now();
+                hyb.run_verify_groups(ip, ng);
+                cpu_thr_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count();
+            });
+        }
+
+        // Experiment (STRATA_INK_PROF=1, prompt batches): GPU time of resident experts, copied experts, CPU wait.
+        static const bool moe_prof = std::getenv("STRATA_INK_PROF") != nullptr;
+        const bool mp = moe_prof && M > 16;
+        auto mp_now = [&]() { if (mp) INK_CK(cudaStreamSynchronize(st)); return std::chrono::steady_clock::now(); };
+        const auto mp_t0 = mp_now();
         if (!chunks.empty()) issue_dma(0, 0);
 
         // Run resident tier==0 VRAM experts on main stream `st` (quantizes x once!)
         launch_ink_moe_dispatch_only(st, sec4_base, experts, info, x_f32, M, ws, force_exact_dec, false);
+        const auto mp_t1 = mp_now();
 
         // Execute each streamed host chunk on GPU Tensor Cores while pf_dma_st overlaps the NEXT chunk!
         for (size_t ci = 0; ci < chunks.size(); ++ci) {
@@ -2093,32 +2208,29 @@ inline void launch_ink_moe_hybrid(
             INK_CK(cudaEventRecord(hyb.pf_ev_done[buf], st));
             hyb.pf_buf_busy[buf] = true;
         }
+        const auto mp_t2 = mp_now();
 
-        // Concurrently evaluate CPU-assigned pairs for M=2..16 on the PERSISTENT worker pool (ZERO std::thread spawns!)
-        // Deduplicates unique cold experts across M verify tokens -> ONE single weight read per expert!
-        if (!cpu_pairs.empty()) {
-            const int np = (int)cpu_pairs.size();
-            int eid_to_grp[kInkExperts];
-            std::memset(eid_to_grp, -1, sizeof(eid_to_grp));
-            int ng = 0;
-            for (int j = 0; j < np; ++j) {
-                const int pid = cpu_pairs[j].first;
-                const int e   = cpu_pairs[j].second;
-                int gi = eid_to_grp[e];
-                if (gi < 0) {
-                    gi = ng++;
-                    eid_to_grp[e] = gi;
-                    hyb.verify_groups[gi].eid = e;
-                    hyb.verify_groups[gi].count = 0;
+        // Concurrently evaluate CPU-assigned pairs on the PERSISTENT worker pool.
+        if (np > 0) {
+            if (cpu_async) {
+                cpu_thr.join();
+                if (mp) {
+                    static double a = 0, c = 0, w = 0; static long n = 0;
+                    const auto t3 = std::chrono::steady_clock::now();
+                    a += std::chrono::duration<double>(mp_t1 - mp_t0).count();
+                    c += std::chrono::duration<double>(mp_t2 - mp_t1).count();
+                    w += std::chrono::duration<double>(t3 - mp_t2).count();
+                    if (++n % 48 == 0) std::fprintf(stderr, "[moe-prof] M=%d ms/visit: resident=%.2f copied(%zu experts)=%.2f cpu-wait=%.2f cpu-thread=%.2f\n",
+                                                 M, 1e3 * a / n, chunks.empty() ? (size_t)0 : host_list.size(), 1e3 * c / n, 1e3 * w / n, 1e3 * cpu_thr_s);
                 }
-                auto& grp = hyb.verify_groups[gi];
-                if (grp.count < 16) {
-                    const int k = grp.count++;
-                    grp.pids[k] = pid;
-                    grp.out_slots[k] = j;
-                }
+                // Learn the CPU cost per routed token for the next split (prompt batches only).
+                if (np >= 64) hyb.cpu_us_per_tok += 0.2 * (1e6 * cpu_thr_s / np - hyb.cpu_us_per_tok);
+                vs_cpu += cpu_thr_s;
+            } else {
+                const auto a = std::chrono::steady_clock::now();
+                hyb.run_verify_groups(ip, ng);
+                vs_cpu += std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count();
             }
-            { const auto a = std::chrono::steady_clock::now(); hyb.run_verify_groups(ip, ng); vs_cpu += std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count(); }
             INK_CK(cudaMemcpyAsync(hyb.d_v_y, hyb.h_v_y, (size_t)np * kInkHidden * 4, cudaMemcpyHostToDevice, st));
             INK_CK(cudaMemcpyAsync(hyb.d_v_p, hyb.h_v_p, (size_t)np * 4, cudaMemcpyHostToDevice, st));
             k_ink_scatter_cpu_pairs<<<np, 256, 0, st>>>(hyb.d_v_y, hyb.d_v_p, ws.topk_w, ws.y_pair, np);
@@ -2142,6 +2254,17 @@ inline void launch_ink_moe_hybrid(
             if (hyb.vs_n % (hyb.stats_every * 4) == 0)
                 std::fprintf(stderr, "[verify-stats] visits=%ld M=%d pcie_experts=%.1f cpu_experts=%.1f host ms/visit: gpu-wait=%.3f cpu=%.3f total=%.3f\n",
                              hyb.vs_n, M, (double)hyb.vs_host_n / hyb.vs_n, (double)hyb.vs_cpu_n / hyb.vs_n, 1e3 * hyb.vs_sync / hyb.vs_n, 1e3 * hyb.vs_cpu / hyb.vs_n, 1e3 * hyb.vs_tot / hyb.vs_n);
+        }
+        if (hyb.stats_every > 0 && M > 16) {
+            // Experiment: prompt-batch visits (gpu-wait = the previous visit's GPU work and copies still running).
+            static long n = 0, n_pcie = 0, n_cpu = 0, n_tok = 0;
+            static double s_sync = 0, s_cpu = 0, s_tot = 0;
+            ++n; n_pcie += (long)host_list.size(); n_cpu += (long)cpu_eids.size(); n_tok += np;
+            s_sync += vs_sync; s_cpu += vs_cpu;
+            s_tot += std::chrono::duration<double>(std::chrono::steady_clock::now() - vs_t0).count();
+            if (n % 192 == 0)
+                std::fprintf(stderr, "[prompt-stats] visits=%ld M=%d pcie_experts=%.1f cpu_experts=%.1f cpu_tokens=%.0f ms/visit: gpu-wait=%.2f cpu=%.2f host-total=%.2f cpu_us/tok=%.1f\n",
+                             n, M, (double)n_pcie / n, (double)n_cpu / n, (double)n_tok / n, 1e3 * s_sync / n, 1e3 * s_cpu / n, 1e3 * s_tot / n, hyb.cpu_us_per_tok);
         }
     }
 

@@ -102,3 +102,22 @@ target_link_libraries(strata_inkling_cuda PUBLIC
 
 target_compile_definitions(strata-inkling PRIVATE INKLING_ENABLE_CUDA=1)
 target_link_libraries(strata-inkling PRIVATE strata_inkling_cuda)
+
+# Small-M S6_K GEMV (decode and DSpark heads) against FP64; skips (77) without a CUDA device. --bench times it.
+if(STRATA_BUILD_TESTS)
+  add_executable(ink_s6k_gemv_test "${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/inkling2/ink_s6k_gemv_test.cu")
+  target_include_directories(ink_s6k_gemv_test PRIVATE ${_ink_cuda_inc})
+  set_target_properties(ink_s6k_gemv_test PROPERTIES
+    CUDA_STANDARD 20
+    CUDA_STANDARD_REQUIRED ON
+    CUDA_ARCHITECTURES "${STRATA_INK_CUDA_ARCHS}"
+    CUDA_RUNTIME_LIBRARY Shared
+  )
+  target_compile_options(ink_s6k_gemv_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+  if(WIN32)
+    target_compile_definitions(ink_s6k_gemv_test PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+  endif()
+  target_link_libraries(ink_s6k_gemv_test PRIVATE CUDA::cudart)
+  add_test(NAME ink_s6k_gemv_test COMMAND ink_s6k_gemv_test)
+  set_tests_properties(ink_s6k_gemv_test PROPERTIES SKIP_RETURN_CODE 77)
+endif()
